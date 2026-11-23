@@ -1,0 +1,64 @@
+//! Creates and runs virtual machines.
+//!
+//! No daemon keeps the machines. They are folders in a store ([`Store`]), which any number of
+//! programs may read and change at the same time, and each running machine has a process of its
+//! own ([`process`]) that is reached over a socket. [`Host`] puts the two together.
+
+mod client;
+mod console;
+mod download;
+mod engine;
+mod host;
+mod images;
+mod import;
+mod iso;
+mod lock;
+mod paths;
+pub mod process;
+mod qcow2;
+mod seed;
+mod store;
+
+pub use host::{CreateOptions, Host, ImageSummary, Machine, MachineState, Progress};
+pub use paths::{cache_directory, home_directory};
+pub use proto::{Error, ErrorCode, NAME, Result};
+pub use store::{Config, DiskConfig, DiskFormat, Store};
+
+use std::fmt::Display;
+use std::path::Path;
+
+/// Turns a failure of the system into an error that says what was being done.
+pub(crate) trait Context<T> {
+    /// `doing` completes "Couldn't …": `"read the machine's settings"`.
+    fn context(self, doing: impl Display) -> Result<T>;
+
+    /// For a failure that is about one file.
+    fn at(self, doing: &str, path: &Path) -> Result<T>;
+}
+
+impl<T> Context<T> for std::io::Result<T> {
+    fn context(self, doing: impl Display) -> Result<T> {
+        self.map_err(|error| Error::new(ErrorCode::Io, format!("Couldn't {doing}: {error}.")))
+    }
+
+    fn at(self, doing: &str, path: &Path) -> Result<T> {
+        self.context(format_args!("{doing} {}", path.display()))
+    }
+}
+
+/// Seconds since 1970.
+pub(crate) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Bytes that nobody can guess, as hexadecimal digits.
+pub(crate) fn random_hex(bytes: usize) -> Result<String> {
+    use std::io::Read;
+    let mut buffer = vec![0; bytes];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut buffer))
+        .context("read random numbers from the system")?;
+    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
+}

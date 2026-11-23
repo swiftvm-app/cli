@@ -1,0 +1,28 @@
+[package]
+name = "host"
+description = "The library: the store of machines, images, the engines and the process that runs a machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+proto.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Reads the compressed clusters of QCOW2 images.
+miniz_oxide = "0.9"
+# TLS and checksums without a C compiler, which keeps builds for other systems simple. It is
+# written for arm64 and x86-64 only, and so is everything here.
+graviola = "0.4"
+rustls-graviola = "0.4"
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-virtualization = "0.3"
