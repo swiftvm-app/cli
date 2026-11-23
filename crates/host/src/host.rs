@@ -96,13 +96,23 @@ pub struct ImageSummary {
     pub cached: bool,
 }
 
+/// The process that runs the machine in `directory`, if one does.
+///
+/// The machine's lock being held isn't enough to say so: someone who is deleting the machine
+/// holds it too, and a process that was killed leaves its note behind. The note has to be there
+/// and name a process that is alive.
+fn running_process(directory: &Path) -> Option<u32> {
+    if !client::is_running(directory) {
+        return None;
+    }
+    let pid = client::process_file(directory)?.pid;
+    // Safety: signal 0 only asks whether the process is there.
+    (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
+}
+
 fn summary(directory: &Path, name: &str) -> Machine {
-    let running = client::is_running(directory);
-    let pid = if running {
-        client::process_file(directory).map(|process| process.pid)
-    } else {
-        None
-    };
+    let pid = running_process(directory);
+    let running = pid.is_some();
     let mut machine = Machine {
         name: name.to_string(),
         state: if running {
@@ -366,7 +376,13 @@ impl Host {
         let directory = self.store.find(name)?;
         let lock = directory.join(LOCK);
         // Holding the lock keeps the machine from starting while its files go.
-        let take = |limit| Lock::take_within(&lock, limit).at("lock", &lock);
+        let take = |limit| {
+            Lock::take_within(&lock, limit).or_else(|error| {
+                // Someone else deleted the machine in the meantime: then it is no longer found.
+                self.store.find(name)?;
+                Err(error).at("lock", &lock)
+            })
+        };
         let stopped = match take(Duration::from_millis(200))? {
             Some(stopped) => stopped,
             None if force => {

@@ -273,8 +273,10 @@ mod tests {
         let directory = store.publish(&mut staged, "a").unwrap();
         assert_eq!(store.names().unwrap(), ["a"]);
         assert!(directory.join(Config::FILE).exists());
-        // Published, its lock is free: it isn't running.
-        assert!(!Lock::is_held(&directory.join(LOCK)));
+        // Published, its lock is free: it isn't running. Waited for, because another test that
+        // starts a program hands it a copy of every open file for a moment, this lock's too.
+        let free = Lock::take_within(&directory.join(LOCK), std::time::Duration::from_secs(5)).unwrap();
+        assert!(free.is_some());
 
         let mut second = store.stage().unwrap();
         assert_eq!(
