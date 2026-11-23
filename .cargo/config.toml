@@ -1,0 +1,7 @@
+# A program that runs virtual machines on a Mac needs the virtualization entitlement in its signature.
+# The runner signs what `cargo run` and `cargo test` build before starting it.
+[target.aarch64-apple-darwin]
+runner = "scripts/sign-run.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/sign-run.sh"
