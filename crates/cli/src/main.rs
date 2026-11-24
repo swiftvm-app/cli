@@ -92,7 +92,7 @@ fn usage() -> String {
                              Unix socket, without a password, that only this user can open.
   screenshot <machine> [<file> | -]
                              The guest's screen as a PNG, at its full size. Without a file it
-                             goes to the temporary folder, and its path is printed.
+                             goes to the runtime folder, and its path is printed.
   click <machine> <x> <y>    Click at a pixel of the screen, from its top left corner.
       --right, --middle      With another button.
       --double, --count <n>  Click twice, or up to three times.
