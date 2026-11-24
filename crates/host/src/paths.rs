@@ -1,4 +1,7 @@
-//! Where the store and the cache are, and where sockets go.
+//! Where the store, the cache and the runtime folder are, and where sockets go.
+//!
+//! Each has a variable of its own, so that a program shipped in an app keeps to the app's folders
+//! and never meets a copy installed on the same computer.
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -70,7 +73,7 @@ pub fn socket_path(machine: &Path, id: &str, name: &str) -> Result<PathBuf> {
     if inside.as_os_str().len() <= LONGEST_SOCKET_PATH {
         return Ok(inside);
     }
-    let outside = short_directory()?.join(format!("{id}.{name}.sock"));
+    let outside = runtime_directory()?.join(format!("{id}.{name}.sock"));
     if outside.as_os_str().len() > LONGEST_SOCKET_PATH {
         return Err(Error::new(
             ErrorCode::Io,
@@ -83,11 +86,26 @@ pub fn socket_path(machine: &Path, id: &str, name: &str) -> Result<PathBuf> {
     Ok(outside)
 }
 
-/// A folder with a short path for this user's sockets: under `XDG_RUNTIME_DIR` where there is
-/// one, or in `/tmp`.
-fn short_directory() -> Result<PathBuf> {
+/// The runtime folder, for what lasts no longer than the computer is on: sockets whose path is too
+/// long for their machine's folder, and screenshots taken without a path. `<NAME>_RUNTIME`, or a
+/// folder of this user's under `XDG_RUNTIME_DIR` where there is one, or in `/tmp`. Its path should
+/// be short: a socket's path has room for 103 bytes on macOS.
+pub fn runtime_directory() -> Result<PathBuf> {
+    runtime_in(environment(&variable("RUNTIME")))
+}
+
+fn runtime_in(chosen: Option<PathBuf>) -> Result<PathBuf> {
     // Safety: getuid has nothing to fail at.
     let user = unsafe { libc::getuid() };
+    if let Some(chosen) = chosen {
+        let directory = std::path::absolute(&chosen).at("find", &chosen)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .at("create", &directory)?;
+        return Ok(directory);
+    }
     let directory = match environment("XDG_RUNTIME_DIR").filter(|path| path.is_absolute()) {
         Some(runtime) if cfg!(not(target_os = "macos")) => runtime.join(NAME),
         _ => PathBuf::from(format!("/tmp/{NAME}-{user}")),
@@ -129,5 +147,18 @@ mod tests {
         assert!(!path.starts_with(&long));
         assert!(path.as_os_str().len() <= LONGEST_SOCKET_PATH);
         assert!(path.ends_with("0123.control.sock"));
+    }
+
+    #[test]
+    fn a_chosen_runtime_folder_is_made_for_this_user_alone() {
+        let root = std::env::temp_dir().join(format!("runtime-test-{}", std::process::id()));
+        let chosen = root.join("a/b");
+        assert_eq!(runtime_in(Some(chosen.clone())).unwrap(), chosen);
+        let found = std::fs::metadata(&chosen).unwrap();
+        assert!(found.is_dir());
+        assert_eq!(found.mode() & 0o777, 0o700);
+        // Again, once it is there.
+        assert_eq!(runtime_in(Some(chosen.clone())).unwrap(), chosen);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

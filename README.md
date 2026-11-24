@@ -2,7 +2,7 @@
 
 Creates and runs Linux virtual machines for AI agents, on macOS and Linux, on arm64 and x86-64. No daemon: each running machine is a process of its own.
 
-It lives alongside the SwiftVM app and its `swiftvm` command: its own command, folders (`~/Library/Application Support/svm`, `~/Library/Caches/svm`, or `~/.local/share/svm` and `~/.cache/svm` on Linux) and variables (`SVM_HOME`, `SVM_CACHE`).
+It lives alongside the SwiftVM app and its `swiftvm` command: its own command, folders (`~/Library/Application Support/svm`, `~/Library/Caches/svm`, or `~/.local/share/svm` and `~/.cache/svm` on Linux) and variables (`SVM_HOME`, `SVM_CACHE`, `SVM_RUNTIME`). An app that ships `svm` inside it sets those three to folders of its own, so it never meets an installed `svm`: see [docs/api.md](docs/api.md#shipping-the-program-in-an-app).
 
 ## Install
 

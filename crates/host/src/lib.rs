@@ -34,7 +34,7 @@ pub use host::{
     CreateOptions, DiskCheck, DiskInfo, ExecOptions, Host, ImageSummary, LayerCheck, LayerInfo, Machine,
     MachineState, Progress, SnapshotInfo,
 };
-pub use paths::{cache_directory, home_directory};
+pub use paths::{cache_directory, home_directory, runtime_directory};
 pub use proto::agent::{Address, Ended, GuestInfo, Setup, SetupState};
 pub use proto::relay::relay;
 pub use proto::{Error, ErrorCode, Input, NAME, Result, SCREEN_PORT, ScreenSize};

@@ -173,11 +173,16 @@ Replace your list with each line. Changes to `disk_used` and `disk_shared` alone
 |---|---|---|---|
 | `SVM_HOME` | `~/Library/Application Support/svm` | `$XDG_DATA_HOME/svm` or `~/.local/share/svm` | Machines, images and layers |
 | `SVM_CACHE` | `~/Library/Caches/svm` | `$XDG_CACHE_HOME/svm` or `~/.cache/svm` | Downloaded images, and the engine on Linux |
+| `SVM_RUNTIME` | `/tmp/svm-<uid>` | `$XDG_RUNTIME_DIR/svm` or `/tmp/svm-<uid>` | Sockets whose path is too long for their machine's folder, and screenshots taken without a path |
 
-Every program that uses the same folders sees the same machines. Several may run at once.
+Every program that uses the same folders sees the same machines. Several may run at once. A program with folders of its own sees none of another's machines, and shares no file with it.
+
+A chosen `SVM_RUNTIME` is made, for this user alone, if it isn't there. Keep its path short: a socket's path has room for 103 bytes on macOS.
 
 ## Shipping the program in an app
 
+- Give the program the app's own folders: set `SVM_HOME`, `SVM_CACHE` and `SVM_RUNTIME` for every command the app runs. Then it never meets an `svm` installed on the same computer, which keeps to the default folders. Set all three every time, rather than relying on them being unset: the app may be started from a shell where the user set them for their own `svm`.
+- The program finds itself by its own path, never through `PATH`: machine processes and `ssh`'s proxy run the copy in the app.
 - Each running machine is a process of the same program. Machine processes outlive the app. Replace the program by writing a new file and renaming it over the old one, never by writing into it: running machines keep the file they started from.
 - On macOS the program needs the `com.apple.security.virtualization` entitlement. Re-signing it, for example with a Developer ID, has to keep that entitlement.
 - On Linux, put `passt` next to the program, or rely on the system's. Its version must support `--vhost-user`.

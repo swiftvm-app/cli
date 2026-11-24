@@ -4,7 +4,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use host::{Button, Direction, Error, ErrorCode, Host, NAME, Result};
+use host::{Button, Direction, Error, ErrorCode, Host, Result};
 use serde_json::json;
 
 use crate::{Arguments, Done, invalid, plain};
@@ -45,17 +45,9 @@ pub(crate) fn stamp() -> String {
     }
 }
 
-/// Where a screenshot goes when nobody said: a folder of this program's in the system's
-/// temporary folder.
+/// Where a screenshot goes when nobody said: the runtime folder.
 fn default_path(machine: &str) -> Result<PathBuf> {
-    let folder = std::env::temp_dir().join(NAME);
-    std::fs::create_dir_all(&folder).map_err(|error| {
-        Error::new(
-            ErrorCode::Io,
-            format!("Couldn't create {}: {error}.", folder.display()),
-        )
-    })?;
-    Ok(folder.join(format!("{machine}-{}.png", stamp())))
+    Ok(host::runtime_directory()?.join(format!("{machine}-{}.png", stamp())))
 }
 
 /// Writes `bytes` to `path` whole or not at all.
