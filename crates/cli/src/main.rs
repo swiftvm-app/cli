@@ -6,6 +6,7 @@ mod disk;
 mod guest;
 mod image;
 mod mcp;
+mod watch;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -14,6 +15,10 @@ use std::time::{Duration, Instant};
 
 use host::{CreateOptions, Error, ErrorCode, Host, Machine, MachineState, NAME, Progress, Result};
 use serde_json::json;
+
+/// The version of what `--json` prints, and of `watch`'s lines: docs/api.md. Fields may be added
+/// to a version; one that renames, removes or changes the meaning of anything is a new version.
+const API: u32 = 1;
 
 fn usage() -> String {
     format!(
@@ -36,6 +41,8 @@ fn usage() -> String {
       --nested               Let the guest run virtual machines of its own. On a Mac with an
                              M3 or later and macOS 15 or later.
   list                       The machines and whether they are running.
+  watch                      Say what changes about the machines, until stopped. With --json,
+                             a line like list's at first and whenever a machine changes.
   start <machine>            Start a machine. Returns once it has started to boot.
   stop <machine>             Shut a machine down, and cut its power if that takes too long.
       --timeout <seconds>    How long the guest gets to shut down. 30 unless said.
@@ -110,7 +117,8 @@ fn usage() -> String {
   version
 
 Every command takes --json, and then prints one JSON document: its result, or
-{{\"error\": {{\"code\": ..., \"message\": ...}}}}.",
+{{\"error\": {{\"code\": ..., \"message\": ...}}}}. Long commands also write how far they
+have come as JSON lines on the error output.",
         scripts = host::setup_scripts().join(", ")
     )
 }
@@ -292,10 +300,16 @@ fn ago(seconds: u64) -> String {
     }
 }
 
+/// Writes one JSON document as a line on the error output: how far a command has come, for a
+/// program that runs it with `--json`. Standard output holds only the result.
+fn json_note(value: serde_json::Value) {
+    _ = writeln!(std::io::stderr().lock(), "{value}");
+}
+
 /// Shows how far a long task has come, on the error output so that the result stays clean.
 struct Meter {
-    /// Nothing is shown: the result is JSON.
-    quiet: bool,
+    /// The result is JSON, and so is each step: one line each ([`json_note`]).
+    json: bool,
     /// A terminal gets a line that is kept up to date, anything else one line for each step.
     live: bool,
     step: Option<&'static str>,
@@ -303,9 +317,9 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(quiet: bool) -> Self {
+    fn new(json: bool) -> Self {
         Self {
-            quiet,
+            json,
             live: std::io::stderr().is_terminal(),
             step: None,
             shown: Instant::now(),
@@ -313,9 +327,6 @@ impl Meter {
     }
 
     fn show(&mut self, progress: Progress) {
-        if self.quiet {
-            return;
-        }
         let (step, detail) = match progress {
             Progress::Downloading {
                 received,
@@ -350,19 +361,28 @@ impl Meter {
         };
         let is_new = self.step != Some(step);
         self.step = Some(step);
+        // Each new step, and then at most ten lines a second.
+        let due = is_new || self.shown.elapsed() >= Duration::from_millis(100);
+        if self.json {
+            if due {
+                self.shown = Instant::now();
+                json_note(json!(progress));
+            }
+            return;
+        }
         let mut output = std::io::stderr().lock();
         if !self.live {
             if is_new {
                 _ = writeln!(output, "{step}...");
             }
-        } else if is_new || self.shown.elapsed() >= Duration::from_millis(100) {
+        } else if due {
             self.shown = Instant::now();
             _ = write!(output, "\r\x1b[K{step}: {detail}");
         }
     }
 
     fn finish(&self) {
-        if self.live && self.step.is_some() {
+        if !self.json && self.live && self.step.is_some() {
             eprint!("\r\x1b[K");
         }
     }
@@ -510,6 +530,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             return desktop::run(command, words, json);
         }
         "mcp" => return mcp::run(words),
+        "watch" => return watch::run(words, json),
         _ => Err(invalid(format!(
             "{NAME} has no command \"{command}\". `{NAME} help` lists the commands."
         ))),
@@ -532,7 +553,12 @@ fn main() -> ExitCode {
     words.retain(|word| word != "--json");
     words.extend(rest);
     let Some(command) = words.first().cloned() else {
-        eprintln!("{}", usage());
+        if json {
+            let error = invalid(format!("Say which command. `{NAME} help` lists them."));
+            println!("{}", json!({ "error": error }));
+        } else {
+            eprintln!("{}", usage());
+        }
         return ExitCode::from(2);
     };
     match command.as_str() {
@@ -547,7 +573,7 @@ fn main() -> ExitCode {
         "version" | "--version" if json => {
             println!(
                 "{}",
-                json!({ "name": NAME, "version": env!("CARGO_PKG_VERSION") })
+                json!({ "name": NAME, "version": env!("CARGO_PKG_VERSION"), "api": API })
             );
             return ExitCode::SUCCESS;
         }

@@ -87,7 +87,11 @@ pub struct ExecOptions {
 }
 
 /// How far the creation of a machine has come.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// As JSON it is an object whose `progress` names the step, with the step's fields beside it:
+/// `{"progress": "downloading", "received": 1048576, "total": 2097152}`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "progress", rename_all = "kebab-case")]
 pub enum Progress {
     /// The image is on its way: bytes that have arrived, and of how many if the server said.
     Downloading { received: u64, total: Option<u64> },

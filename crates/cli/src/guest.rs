@@ -135,9 +135,20 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             let name = arguments.subject("machine")?;
             let timeout = seconds(&arguments, "timeout")?;
             let mut shown = None;
+            let mut reported = None;
             let info = Host::open()?.wait(name, timeout, &mut |info| {
+                if json {
+                    let now = (info.booted, info.setup.clone());
+                    if reported.as_ref() != Some(&now) {
+                        crate::json_note(
+                            json!({ "progress": "guest", "booted": info.booted, "setup": info.setup }),
+                        );
+                        reported = Some(now);
+                    }
+                    return;
+                }
                 let line = setup_line(info);
-                if !json && line.is_some() && line != shown {
+                if line.is_some() && line != shown {
                     eprintln!("{}", plain(line.as_deref().unwrap_or_default()));
                     shown = line;
                 }
@@ -235,7 +246,7 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             if ports.is_empty() {
                 return Err(invalid("Say which ports: forward <machine> 8080:80."));
             }
-            forward(name, ports)
+            forward(name, ports, json)
         }
         "tunnel" => {
             let arguments = Arguments::parse(words, &[], &[])?;
@@ -282,7 +293,7 @@ fn tunnel(stream: std::os::unix::net::UnixStream) {
     _ = std::io::copy(&mut receiving, &mut Unbuffered(std::io::stdout().lock()));
 }
 
-fn forward(name: &str, ports: &[String]) -> Result<Done> {
+fn forward(name: &str, ports: &[String], json: bool) -> Result<Done> {
     let host = Arc::new(Host::open()?);
     host.machine(name)?;
     let mut listeners = Vec::new();
@@ -299,18 +310,41 @@ fn forward(name: &str, ports: &[String]) -> Result<Done> {
                 format!("Couldn't listen on port {local}: {error}."),
             )
         })?;
-        eprintln!("Forwarding localhost:{local} to port {remote} of {name}.");
-        listeners.push((listener, remote));
+        // Port 0 is any free port: say which one it is.
+        let local = listener
+            .local_addr()
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::Io,
+                    format!("Couldn't listen on port {local}: {error}."),
+                )
+            })?
+            .port();
+        listeners.push((listener, local, remote));
     }
-    eprintln!("Control-C stops.");
+    if json {
+        // A program that runs this learns that it can connect, and to what.
+        let forwarding: Vec<_> = listeners
+            .iter()
+            .map(|(_, local, remote)| json!({ "local": local, "guest": remote }))
+            .collect();
+        println!("{}", json!({ "forwarding": forwarding }));
+        _ = std::io::stdout().flush();
+    } else {
+        for (_, local, remote) in &listeners {
+            eprintln!("Forwarding localhost:{local} to port {remote} of {name}.");
+        }
+        eprintln!("Control-C stops.");
+    }
     let mut threads = Vec::new();
-    for (listener, remote) in listeners {
+    for (listener, _, remote) in listeners {
         let (host, name) = (host.clone(), name.to_string());
         threads.push(std::thread::spawn(move || {
             for connection in listener.incoming().flatten() {
                 let (host, name) = (host.clone(), name.clone());
                 std::thread::spawn(move || match host.tunnel(&name, remote) {
                     Ok(stream) => host::relay(connection, stream),
+                    Err(error) if json => crate::json_note(json!({ "error": error })),
                     Err(error) => eprintln!("{NAME}: {}", plain(&error.message)),
                 });
             }

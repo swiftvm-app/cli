@@ -68,14 +68,15 @@ jobs:
           rustup update stable
           rustup target add ${{ matrix.target }}
       # Ubuntu 24.04's passt is too old for vhost-user, so this also checks the bundled one.
-      - name: Build, with passt next to the program
-        run: scripts/build.sh ${{ matrix.target }}
+      - name: Install, with passt next to the program
+        run: scripts/install.sh "$RUNNER_TEMP/bin"
       - name: Create, start, use and delete a machine
         if: steps.kvm.outputs.present == 'yes'
         run: |
           set -x
-          program=dist/${{ matrix.target }}/$NAME
-          test -x "$(dirname "$program")/passt"
+          program=$RUNNER_TEMP/bin/$NAME
+          test -x "$RUNNER_TEMP/bin/passt"
+          test "$("$program" version --json | jq .api)" = 1
           "$program" create debian-13 --name a --cpus 2 --memory 2G --user runner --password password
           "$program" start a
           "$program" wait a --timeout 600

@@ -169,13 +169,13 @@ pub fn snapshots(command: &str, words: &[String], json: bool) -> Result<Done> {
             let (machine, name) = pair(&arguments, "machine", "snapshot")?;
             host.revert(machine, name)?;
             said(json, format!("Reverted {machine} to the snapshot {name}."));
-            Ok(json!({ "machine": machine, "reverted": name }).into())
+            Ok(json!({ "machine": host.machine(machine)?, "reverted": name }).into())
         }
         "delete-snapshot" => {
             let (machine, name) = pair(&arguments, "machine", "snapshot")?;
             host.delete_snapshot(machine, name)?;
             said(json, format!("Deleted the snapshot {name} of {machine}."));
-            Ok(json!({ "machine": machine, "deleted": name }).into())
+            Ok(json!({ "machine": host.machine(machine)?, "deleted": name }).into())
         }
         _ => unreachable!("only the snapshot commands come here"),
     }
