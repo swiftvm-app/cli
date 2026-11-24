@@ -645,6 +645,7 @@ mod tests {
                 created: 0,
                 snapshots,
                 automatic: None,
+                nested: false,
             }
             .save(&self.machine)
             .unwrap();

@@ -33,6 +33,8 @@ fn usage() -> String {
       --password <password>  The account's password. Without one it has none to sign in with.
       --script <script>      Set something up once the first start is over: {scripts}, or the
                              path of a script. Can be given more than once.
+      --nested               Let the guest run virtual machines of its own. On a Mac with an
+                             M3 or later and macOS 15 or later.
   list                       The machines and whether they are running.
   start <machine>            Start a machine. Returns once it has started to boot.
   stop <machine>             Shut a machine down, and cut its power if that takes too long.
@@ -331,6 +333,13 @@ impl Meter {
                 received,
                 total: None,
             } => ("Downloading the image", size(received)),
+            Progress::DownloadingEngine { received, total } => (
+                "Downloading the engine",
+                match total {
+                    Some(total) => format!("{} of {}", size(received), size(total)),
+                    None => size(received),
+                },
+            ),
             Progress::WritingDisk { fraction } => {
                 ("Preparing the image", format!("{:.0}%", fraction * 100.0))
             }
@@ -409,7 +418,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             let arguments = Arguments::parse(
                 words,
                 &["name", "cpus", "memory", "disk", "user", "password", "script"],
-                &[],
+                &["nested"],
             )?;
             let options = CreateOptions {
                 image: arguments.subject("image")?.to_string(),
@@ -420,6 +429,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 user: arguments.value("user"),
                 password: arguments.value("password"),
                 scripts: arguments.values("script"),
+                nested: arguments.flag("nested"),
             };
             let host = Host::open()?;
             let mut meter = Meter::new(json);

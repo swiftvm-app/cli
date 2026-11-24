@@ -10,6 +10,9 @@
 //!     config.lock               held while config.json is changed
 //!     process.json              that process and its socket
 //!     console.log  machine.log  what the guest printed, and what its process had to say
+//!     network.log               what passt had to say, on Linux
+//!     *.sock                    the sockets of its process: control and vnc; disk; on Linux api,
+//!                               vsock and network
 //! ```
 //!
 //! A machine that is being created is put together in a folder that isn't a machine yet, and
@@ -56,6 +59,9 @@ pub struct Config {
     /// finished, its disk becomes an automatic image that the next one starts from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automatic: Option<Automatic>,
+    /// Whether the guest can run virtual machines of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

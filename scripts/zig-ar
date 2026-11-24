@@ -1,0 +1,4 @@
+#!/bin/sh
+# An archiver for Linux targets on a Mac: macOS's own doesn't index the symbols of Linux objects,
+# so the linker wouldn't find zstd's.
+exec zig ar "$@"

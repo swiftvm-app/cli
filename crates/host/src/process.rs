@@ -237,13 +237,52 @@ impl Service {
     }
 }
 
+/// What serves a disk to the engine: a network block device for Apple's framework, a vhost-user
+/// device for cloud-hypervisor.
+enum DiskServer {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Network(disk::nbd::Server),
+    #[cfg(target_os = "linux")]
+    VhostUser(disk::vhost::Server),
+}
+
+impl DiskServer {
+    fn start(disk: Arc<dyn disk::Disk>, socket: &Path, config: &Config) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        return Ok(Self::VhostUser(disk::vhost::Server::start(
+            disk,
+            socket,
+            config.cpus,
+        )?));
+        #[cfg(not(target_os = "linux"))]
+        {
+            _ = config;
+            Ok(Self::Network(disk::nbd::Server::start(disk, socket)?))
+        }
+    }
+
+    fn attachment(&self) -> DiskAttachment {
+        match self {
+            Self::Network(server) => DiskAttachment::Network(server.url()),
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(server) => DiskAttachment::VhostUser(server.path().to_owned()),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Network(server) => server.stop(),
+            #[cfg(target_os = "linux")]
+            Self::VhostUser(server) => server.stop(),
+        }
+    }
+}
+
 /// A machine's disk of layers, served to its engine until it is closed.
 struct ServedDisk {
     /// Taken when the disk is closed. Held while the layer is being sealed, which a close waits
     /// for.
-    server: Mutex<Option<disk::nbd::Server>>,
-    /// Where the engine finds the disk.
-    url: String,
+    server: Mutex<Option<DiskServer>>,
     disk: Arc<disk::Switchable<disk::Layer>>,
     store: Store,
     /// The machine's own layer.
@@ -268,9 +307,8 @@ impl ServedDisk {
         let layer = layers::open(&store, &path, &disk::Options::default())?;
         let disk = Arc::new(disk::Switchable::new(layer));
         let socket = socket_path(directory, &config.id, "disk")?;
-        let server = disk::nbd::Server::start(disk.clone(), &socket).at("serve the disk on", &socket)?;
+        let server = DiskServer::start(disk.clone(), &socket, config).at("serve the disk on", &socket)?;
         Ok(Self {
-            url: server.url(),
             server: Mutex::new(Some(server)),
             disk,
             store,
@@ -478,10 +516,18 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
         DiskFormat::Layer => Some(Arc::new(ServedDisk::start(directory, &config)?)),
     };
     let disk = match &served {
-        Some(served) => DiskAttachment::Network(served.url.clone()),
+        Some(served) => served
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("just started")
+            .attachment(),
         None => DiskAttachment::File(directory.join(&config.disk.file)),
     };
     let spec = Spec {
+        id: config.id.clone(),
+        nested: config.nested,
         cpus: config.cpus,
         memory: config.memory,
         disk,

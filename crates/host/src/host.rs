@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use proto::agent::{Ended, Exec, GuestInfo, Job, SetupState, receive_copy, run_job, send_copy};
 use serde::Serialize;
 
+use crate::engine;
 use crate::images::{self, ARCH};
 use crate::lock::Lock;
 use crate::paths::socket_path;
@@ -65,6 +66,8 @@ pub struct CreateOptions {
     /// Setup scripts, run one after the other once the first start is over: the names of those
     /// that come with this library ([`setup_scripts`](crate::setup_scripts)), or paths of files.
     pub scripts: Vec<String>,
+    /// Lets the guest run virtual machines of its own. Not every computer can.
+    pub nested: bool,
 }
 
 /// A command to run in a guest.
@@ -88,6 +91,9 @@ pub struct ExecOptions {
 pub enum Progress {
     /// The image is on its way: bytes that have arrived, and of how many if the server said.
     Downloading { received: u64, total: Option<u64> },
+    /// What runs machines on this computer is on its way, the first time: cloud-hypervisor
+    /// and its firmware on Linux.
+    DownloadingEngine { received: u64, total: Option<u64> },
     /// The image is being made into the layer that its machines' disks are built on, from 0 to
     /// 1. That is done once for each image.
     WritingDisk { fraction: f64 },
@@ -132,6 +138,8 @@ pub struct Machine {
     pub user: String,
     /// Seconds since 1970.
     pub created: u64,
+    /// Whether the guest can run virtual machines of its own.
+    pub nested: bool,
 }
 
 /// An image that machines can be created from.
@@ -312,6 +320,7 @@ fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
         disk_shared: 0,
         user: String::new(),
         created: 0,
+        nested: false,
     };
     match Config::load(directory) {
         Ok(config) => {
@@ -329,6 +338,7 @@ fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
             machine.disk_size = config.disk.size;
             machine.user = config.user;
             machine.created = config.created;
+            machine.nested = config.nested;
         }
         Err(error) if !running => {
             machine.state = MachineState::Broken;
@@ -467,6 +477,9 @@ impl Host {
         if cpus == 0 {
             return invalid("A machine needs at least one processor.");
         }
+        if options.nested {
+            engine::check_nested()?;
+        }
         let memory = options.memory.unwrap_or(DEFAULT_MEMORY);
         if memory < SMALLEST_MEMORY {
             return invalid("A machine needs at least 256 MiB of memory.");
@@ -477,6 +490,9 @@ impl Host {
             Some(Some(disk)) => Some(disk),
             None => None,
         };
+        engine::prepare(&self.cache, &mut |received, total| {
+            progress(Progress::DownloadingEngine { received, total })
+        })?;
 
         // The sealed layer that the machine's disk is built on, and whether the system on it has
         // run before as another machine.
@@ -604,6 +620,7 @@ impl Host {
             created: now(),
             snapshots: Vec::new(),
             automatic,
+            nested: options.nested,
         };
 
         // A machine without a name is called after its image: debian-13, debian-13-2 and so on.
@@ -670,6 +687,7 @@ impl Host {
                 ),
             ));
         }
+        engine::prepare(&self.cache, &mut |_, _| {})?;
         match client::start(&self.program, &directory) {
             // Someone else was starting it at the same moment, which is as good if they managed.
             Err(error) if error.code == ErrorCode::Running => match client::status(&directory) {
@@ -744,10 +762,14 @@ impl Host {
             _ = std::fs::remove_file(process.socket);
         }
         if let Ok(config) = Config::load(directory) {
-            for name in ["disk", "vnc"] {
+            for name in ["disk", "vnc", "api", "vsock", "network"] {
                 if let Ok(socket) = socket_path(directory, &config.id, name)
                     && !socket.starts_with(directory)
                 {
+                    // passt makes one more next to its own.
+                    let mut repair = socket.as_os_str().to_owned();
+                    repair.push(".repair");
+                    _ = std::fs::remove_file(repair);
                     _ = std::fs::remove_file(socket);
                 }
             }
@@ -1531,6 +1553,7 @@ mod tests {
             created: now(),
             snapshots: Vec::new(),
             automatic: None,
+            nested: false,
         }
         .save(&staged.directory)
         .unwrap();

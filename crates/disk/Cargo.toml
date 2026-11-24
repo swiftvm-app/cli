@@ -12,3 +12,15 @@ libc.workspace = true
 crc32fast.workspace = true
 graviola.workspace = true
 zstd.workspace = true
+# A virtio block device's requests, read from and answered in guest memory.
+virtio-queue = "0.18"
+vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
+
+# The vhost-user-blk server, which cloud-hypervisor takes a disk from on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+vhost = { version = "0.18", features = ["vhost-user-backend"] }
+vhost-user-backend = "0.24"
+vmm-sys-util = "0.15"
+
+[dev-dependencies]
+virtio-queue = { version = "0.18", features = ["test-utils"] }

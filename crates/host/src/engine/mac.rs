@@ -78,6 +78,17 @@ fn outcome(error: *mut NSError) -> Result<()> {
     }
 }
 
+/// Whether this Mac lets machines run machines of their own.
+pub(crate) fn nested_supported() -> bool {
+    // Safety: a class method without arguments. Before macOS 15 the class doesn't answer it.
+    unsafe {
+        let class = <VZGenericPlatformConfiguration as objc2::ClassType>::class();
+        let selector = objc2::sel!(isNestedVirtualizationSupported);
+        let answers: bool = msg_send![class, respondsToSelector: selector];
+        answers && VZGenericPlatformConfiguration::isNestedVirtualizationSupported()
+    }
+}
+
 fn file_url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
@@ -141,6 +152,12 @@ fn configuration(spec: Spec) -> Result<Retained<VZVirtualMachineConfiguration>> 
         let platform = VZGenericPlatformConfiguration::new();
         let identifier = identifier(&spec.directory)?;
         platform.setMachineIdentifier(&identifier);
+        if spec.nested {
+            if !nested_supported() {
+                return Err(super::no_nesting());
+            }
+            platform.setNestedVirtualizationEnabled(true);
+        }
         configuration.setPlatform(&platform);
         let loader = VZEFIBootLoader::new();
         let variables = firmware_variables(&spec.directory)?;
@@ -171,6 +188,9 @@ fn configuration(spec: Spec) -> Result<Retained<VZVirtualMachineConfiguration>> 
                     )
                     .map_err(said)?,
                 )
+            }
+            DiskAttachment::VhostUser(_) => {
+                return Err(failed("The framework can't take a disk from a vhost-user device."));
             }
         };
         let mut disks = vec![Retained::into_super(

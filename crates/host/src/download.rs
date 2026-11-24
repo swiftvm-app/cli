@@ -1,10 +1,13 @@
-//! Downloads images into the cache, which every store on this computer shares.
+//! Downloads images, and the engine's programs on Linux, into the cache, which every store on
+//! this computer shares.
 //!
 //! ```text
 //! <cache>/images/<file>            an image that was checked against its publisher's checksum
 //! <cache>/images/<file>.json       what it was checked against
 //! <cache>/images/<file>.partial    a download that isn't finished, to carry on with
 //! <cache>/images/<file>.lock       held by whoever is downloading it
+//! <cache>/engine/<file>            the same for a program of the engine, checked against a
+//!                                  checksum that this library knows
 //! ```
 
 use std::fs::{File, OpenOptions};
@@ -38,16 +41,55 @@ fn beside(file: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
-fn place(cache: &Path, image: &Image) -> PathBuf {
-    cache.join("images").join(image.file_name())
+/// A file to download into the cache, and how it is checked.
+pub(crate) struct Wanted<'a> {
+    pub url: &'a str,
+    /// The folder of the cache that it goes in.
+    pub folder: &'a str,
+    /// Its name there.
+    pub file_name: &'a str,
+    pub algorithm: Algorithm,
+    pub digest: Digest<'a>,
+}
+
+pub(crate) enum Digest<'a> {
+    /// In a listing of checksums that its publisher keeps at this address.
+    Published(&'a str),
+    /// Known in advance, in hexadecimal.
+    Known(&'a str),
+}
+
+impl<'a> From<&'a Image> for Wanted<'a> {
+    fn from(image: &'a Image) -> Self {
+        Self {
+            url: &image.url,
+            folder: "images",
+            file_name: image.file_name(),
+            algorithm: image.algorithm,
+            digest: Digest::Published(&image.checksums),
+        }
+    }
+}
+
+fn place(cache: &Path, wanted: &Wanted) -> PathBuf {
+    cache.join(wanted.folder).join(wanted.file_name)
 }
 
 /// The checked copy of `image` in the cache, if there is one.
 pub(crate) fn cached(cache: &Path, image: &Image) -> Option<PathBuf> {
-    let file = place(cache, image);
+    cached_file(cache, &Wanted::from(image))
+}
+
+/// The checked copy of `wanted` in the cache, if there is one.
+pub(crate) fn cached_file(cache: &Path, wanted: &Wanted) -> Option<PathBuf> {
+    let file = place(cache, wanted);
     let checked: Checked = serde_json::from_slice(&std::fs::read(beside(&file, ".json")).ok()?).ok()?;
     let size = std::fs::metadata(&file).ok()?.len();
-    (checked.url == image.url && checked.size == size).then_some(file)
+    let digest_matches = match wanted.digest {
+        Digest::Known(digest) => checked.digest == digest,
+        Digest::Published(_) => true,
+    };
+    (checked.url == wanted.url && checked.size == size && digest_matches).then_some(file)
 }
 
 /// The checksum that the checked image at `file` in the cache was found to have.
@@ -63,22 +105,34 @@ pub(crate) fn fetch(
     image: &Image,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
-    let file = place(cache, image);
-    let directory = cache.join("images");
+    fetch_file(cache, &Wanted::from(image), progress)
+}
+
+/// Returns `wanted` from the cache, downloading and checking it if it isn't there yet.
+pub(crate) fn fetch_file(
+    cache: &Path,
+    wanted: &Wanted,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<PathBuf> {
+    let file = place(cache, wanted);
+    let directory = cache.join(wanted.folder);
     std::fs::create_dir_all(&directory).at("create", &directory)?;
-    // Two creations may want the same image. One downloads it, and the other finds it there.
+    // Two creations may want the same file. One downloads it, and the other finds it there.
     let lock = beside(&file, ".lock");
     let _downloading = Lock::take(&lock).at("lock", &lock)?;
-    if let Some(found) = cached(cache, image) {
+    if let Some(found) = cached_file(cache, wanted) {
         return Ok(found);
     }
 
     let agent = agent();
-    let expected = published_digest(&agent, image)?;
+    let expected = match wanted.digest {
+        Digest::Published(listing) => published_digest(&agent, listing, wanted)?,
+        Digest::Known(digest) => digest.to_string(),
+    };
     let keep = |file: &Path| -> Result<()> {
         let checked = Checked {
-            url: image.url.clone(),
-            algorithm: image.algorithm,
+            url: wanted.url.to_string(),
+            algorithm: wanted.algorithm,
             digest: expected.clone(),
             size: std::fs::metadata(file).at("look at", file)?.len(),
         };
@@ -86,9 +140,9 @@ pub(crate) fn fetch(
         std::fs::write(&note, serde_json::to_vec(&checked).expect("plain data")).at("write", &note)
     };
 
-    // A file that someone put there is as good as a download, if it is the image.
+    // A file that someone put there is as good as a download, if it is the one.
     if file.exists() {
-        if digest(&file, image.algorithm)? == expected {
+        if digest(&file, wanted.algorithm)? == expected {
             keep(&file)?;
             return Ok(file);
         }
@@ -98,19 +152,19 @@ pub(crate) fn fetch(
     let partial = beside(&file, ".partial");
     let mut resumed = std::fs::metadata(&partial).is_ok_and(|found| found.len() > 0);
     loop {
-        download(&agent, &image.url, &partial, progress)?;
-        if digest(&partial, image.algorithm)? == expected {
+        download(&agent, wanted.url, &partial, progress)?;
+        if digest(&partial, wanted.algorithm)? == expected {
             break;
         }
         std::fs::remove_file(&partial).at("remove", &partial)?;
-        // What an earlier attempt left may be the start of an image that its publisher has
+        // What an earlier attempt left may be the start of a file that its publisher has
         // replaced since. Once more, from the beginning.
         if !resumed {
             return Err(Error::new(
                 ErrorCode::Checksum,
                 format!(
-                    "{} arrived damaged: its checksum isn't the published one. Try again.",
-                    image.file_name()
+                    "{} arrived damaged: its checksum isn't the expected one. Try again.",
+                    wanted.file_name
                 ),
             ));
         }
@@ -140,15 +194,15 @@ fn failed(url: &str, why: impl std::fmt::Display) -> Error {
     Error::new(ErrorCode::Download, format!("Couldn't download {url}: {why}."))
 }
 
-/// The checksum that the image's publisher lists for it.
-fn published_digest(agent: &ureq::Agent, image: &Image) -> Result<String> {
+/// The checksum that the file's publisher lists for it in `listing`.
+fn published_digest(agent: &ureq::Agent, checksums: &str, wanted: &Wanted) -> Result<String> {
     let mut response = agent
-        .get(&image.checksums)
+        .get(checksums)
         .call()
-        .map_err(|error| failed(&image.checksums, error))?;
+        .map_err(|error| failed(checksums, error))?;
     if response.status().as_u16() != 200 {
         return Err(failed(
-            &image.checksums,
+            checksums,
             format_args!(
                 "the server answered with HTTP status {}",
                 response.status().as_u16()
@@ -158,18 +212,18 @@ fn published_digest(agent: &ureq::Agent, image: &Image) -> Result<String> {
     let listing = response
         .body_mut()
         .read_to_string()
-        .map_err(|error| failed(&image.checksums, error))?;
-    let length = match image.algorithm {
+        .map_err(|error| failed(checksums, error))?;
+    let length = match wanted.algorithm {
         Algorithm::Sha256 => 64,
         Algorithm::Sha512 => 128,
     };
-    listed_digest(image.file_name(), &listing)
+    listed_digest(wanted.file_name, &listing)
         .filter(|digest| digest.len() == length && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(|digest| digest.to_ascii_lowercase())
         .ok_or_else(|| {
             Error::new(
                 ErrorCode::Checksum,
-                format!("{} lists no checksum for {}.", image.checksums, image.file_name()),
+                format!("{checksums} lists no checksum for {}.", wanted.file_name),
             )
         })
 }

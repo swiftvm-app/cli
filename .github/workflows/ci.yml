@@ -1,0 +1,93 @@
+# Checks, tests, and a machine started on Linux with KVM.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Checks and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, with the target the guest's agent is built for
+        run: |
+          rustup update stable
+          rustup component add rustfmt clippy
+          rustup target add "$(uname -m | sed 's/arm64/aarch64/')-unknown-linux-musl"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  machine:
+    name: A machine on Linux (${{ matrix.os }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The product's name is in Cargo.toml alone. Its variables say where the store and the cache are.
+      - name: A store and a cache of the job's own
+        run: |
+          name=$(awk -F'"' '/^\[workspace.metadata\]/ { found = 1 } found && /^name *=/ { print $2; exit }' Cargo.toml)
+          variable=$(echo "$name" | tr a-z- A-Z_)
+          echo "NAME=$name" >> "$GITHUB_ENV"
+          echo "${variable}_HOME=$GITHUB_WORKSPACE/ci/home" >> "$GITHUB_ENV"
+          echo "${variable}_CACHE=$GITHUB_WORKSPACE/ci/cache" >> "$GITHUB_ENV"
+      - name: KVM for this user, if the runner has it
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            echo present=yes >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::This runner has no /dev/kvm: no machine is started."
+          fi
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+      # Ubuntu 24.04's passt is too old for vhost-user, so this also checks the bundled one.
+      - name: Build, with passt next to the program
+        run: scripts/build.sh ${{ matrix.target }}
+      - name: Create, start, use and delete a machine
+        if: steps.kvm.outputs.present == 'yes'
+        run: |
+          set -x
+          program=dist/${{ matrix.target }}/$NAME
+          test -x "$(dirname "$program")/passt"
+          "$program" create debian-13 --name a --cpus 2 --memory 2G --user runner --password password
+          "$program" start a
+          "$program" wait a --timeout 600
+          "$program" exec a -- sh -c 'uname -a; curl -sSfI https://example.com | head -1'
+          echo hello > hello.txt
+          "$program" cp hello.txt a:hello.txt
+          test "$("$program" exec a -- cat hello.txt)" = hello
+          "$program" snapshot a one
+          "$program" wait a --timeout 600
+          "$program" stop a
+          "$program" disk check a
+          "$program" delete a
+      - name: The machine's logs
+        if: failure()
+        run: tail -n 100 ci/home/machines/*/machine.log ci/home/machines/*/network.log ci/home/machines/*/console.log || true

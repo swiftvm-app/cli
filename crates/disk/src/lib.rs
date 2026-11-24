@@ -9,6 +9,9 @@ pub mod nbd;
 mod raw;
 pub mod storage;
 mod switch;
+#[cfg(target_os = "linux")]
+pub mod vhost;
+pub mod virtio_blk;
 
 pub use layer::{Header, Layer, Options, Stats};
 pub use raw::RawDisk;

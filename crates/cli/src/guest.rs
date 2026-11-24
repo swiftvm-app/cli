@@ -96,6 +96,9 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                     ),
                     ("Account", machine.user.clone()),
                 ];
+                if machine.nested {
+                    rows.push(("Nested", "yes: the guest can run machines of its own".into()));
+                }
                 match &guest {
                     Some(Ok(info)) => {
                         rows.push(("System", info.system.clone().unwrap_or_else(|| "unknown".into())));
