@@ -166,6 +166,13 @@ fn what_is_refused_says_why() {
         agent.job(&Job::Tunnel { port }).unwrap_err().code,
         ErrorCode::Guest
     );
+    // Outside Linux, and in Linux for anyone but root, the file system isn't frozen.
+    if cfg!(not(target_os = "linux")) || unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            agent.job(&Job::Freeze { seconds: 1 }).unwrap_err().code,
+            ErrorCode::Guest
+        );
+    }
 }
 
 fn write_tree(root: &Path) {

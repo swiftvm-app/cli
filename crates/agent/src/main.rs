@@ -7,9 +7,12 @@
 //! agent listen <path>   listen on a Unix socket instead, to try the agent outside a guest
 //! agent pack <path>     write what is at <path> to the standard output, for `cp`
 //! agent unpack <path>   put what the standard input holds at <path>, for `cp`
+//! agent identity        renew the machine ID of a machine made from an image, early in its start
 //! ```
 
 mod account;
+mod freeze;
+mod identity;
 mod job;
 mod serve;
 mod system;
@@ -37,12 +40,29 @@ fn main() -> ExitCode {
                 path,
             )
         }
+        (Some("identity"), None) => match identity::renew(Path::new("/")) {
+            Ok(outcome) => {
+                eprintln!("{outcome:?}");
+                if outcome == identity::Outcome::Renewed {
+                    // The journal had started with the machine ID that was there before, and
+                    // would go on writing under it. Queued, as this runs before most of the start.
+                    _ = std::process::Command::new("systemctl")
+                        .args(["restart", "--no-block", "systemd-journald.service"])
+                        .status();
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Couldn't renew the machine ID: {error}");
+                ExitCode::FAILURE
+            }
+        },
         (Some("unpack"), Some(path)) if arguments.len() == 2 => {
             // The host is trusted to name what it sends.
             finish(proto::copy::unpack(std::io::stdin().lock(), path, None), path)
         }
         _ => {
-            eprintln!("usage: agent [listen <socket> | pack <path> | unpack <path>]");
+            eprintln!("usage: agent [listen <socket> | pack <path> | unpack <path> | identity]");
             ExitCode::from(2)
         }
     }
@@ -80,6 +100,8 @@ fn listen(path: &Path) -> ExitCode {
 fn serve_socket_device() -> ExitCode {
     use std::time::Duration;
 
+    // An agent that ended while the file system was frozen left it so.
+    freeze::thaw();
     let agent = Arc::new(Agent::new());
     // The socket device's driver may not be there yet this early in the system's start.
     let mut said = false;

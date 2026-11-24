@@ -18,6 +18,7 @@ mod lock;
 mod paths;
 pub mod process;
 mod qcow2;
+mod saved;
 mod scripts;
 mod seed;
 mod store;
@@ -25,14 +26,15 @@ mod store;
 pub use disk::layer::CLUSTER as LAYER_CLUSTER;
 pub use host::{
     CreateOptions, DiskCheck, DiskInfo, ExecOptions, Host, ImageSummary, LayerCheck, LayerInfo, Machine,
-    MachineState, Progress,
+    MachineState, Progress, SnapshotInfo,
 };
 pub use paths::{cache_directory, home_directory};
 pub use proto::agent::{Address, Ended, GuestInfo, Setup, SetupState};
 pub use proto::relay::relay;
 pub use proto::{Error, ErrorCode, NAME, Result};
+pub use saved::ImageKind;
 pub use scripts::built_in as setup_scripts;
-pub use store::{Config, DiskConfig, DiskFormat, Store};
+pub use store::{Automatic, Config, DiskConfig, DiskFormat, Snapshot, Store};
 
 use std::fmt::Display;
 use std::path::Path;

@@ -167,6 +167,7 @@ dependencies = [
  "rustls-graviola",
  "serde",
  "serde_json",
+ "tar",
  "ureq",
 ]
 

@@ -13,6 +13,9 @@ cp "$from/agent" "$home/agent.new"
 chmod 755 "$home/agent.new"
 mv -f "$home/agent.new" "$home/agent"
 cp "$from/agent.service" "$units/@NAME@-agent.service"
+cp "$from/identity.service" "$units/@NAME@-identity.service"
+# Notes which instance this disk is in use by, so that a machine made from it knows it is another.
+"$home/agent" identity || true
 
 if [ -f "$from/script-1" ]; then
     mkdir -p "$home/setup/scripts"
@@ -30,7 +33,7 @@ if [ -f "$from/script-1" ]; then
 fi
 
 systemctl daemon-reload
-systemctl enable @NAME@-agent.service
+systemctl enable @NAME@-agent.service @NAME@-identity.service
 # Without waiting: this runs inside the first-start setup.
 systemctl start --no-block @NAME@-agent.service
 if [ -f "$home/setup/run.sh" ]; then

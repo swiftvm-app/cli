@@ -1,12 +1,13 @@
 //! The store: a folder with one folder per machine.
 //!
 //! ```text
-//! <store>/lock                  held while the set of machines changes
+//! <store>/lock                  held while the set of machines or of layers changes
 //! <store>/layers/               sealed layers that machines' disks are built on (`layers`)
 //! <store>/machines/<name>/      a machine
 //!     config.json               what it is made of
 //!     disk.layer  seed.iso      its disk, and what sets it up on its first start
 //!     lock                      held by its process for as long as it runs
+//!     config.lock               held while config.json is changed
 //!     process.json              that process and its socket
 //!     console.log  machine.log  what the guest printed, and what its process had to say
 //! ```
@@ -34,7 +35,7 @@ pub struct Config {
     /// Stays the same when the machine is renamed.
     pub id: String,
     pub name: String,
-    /// The image of the catalog that it was created from.
+    /// The image that it was created from: of the catalog, or one made from a machine.
     pub image: String,
     /// `arm64` or `x86-64`.
     pub arch: String,
@@ -48,6 +49,31 @@ pub struct Config {
     pub user: String,
     /// Seconds since 1970.
     pub created: u64,
+    /// Sealed layers of its disk that it can go back to, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<Snapshot>,
+    /// Said of the first machine of an image and its setup scripts: once the setup has
+    /// finished, its disk becomes an automatic image that the next one starts from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<Automatic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub name: String,
+    /// The SHA-256 of the sealed layer, in hexadecimal.
+    pub layer: String,
+    /// Seconds since 1970.
+    pub created: u64,
+}
+
+/// The automatic image that a machine's disk is to become.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Automatic {
+    /// What the image is found by: the image it starts from, its scripts and its account.
+    pub key: String,
+    /// The names of the setup scripts, for showing.
+    pub scripts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +106,16 @@ impl Config {
         if config.version > CONFIG_VERSION {
             return Err(unreadable("it was written by a newer version".into()));
         }
+        Ok(config)
+    }
+
+    /// Changes the machine's settings with `change`, with nobody else changing them meanwhile.
+    pub(crate) fn update(machine: &Path, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<Self> {
+        let path = machine.join(CONFIG_LOCK);
+        let _changing = Lock::take(&path).at("lock", &path)?;
+        let mut config = Self::load(machine)?;
+        change(&mut config)?;
+        config.save(machine)?;
         Ok(config)
     }
 
@@ -137,6 +173,8 @@ impl Drop for Staged {
 const STAGING: &str = ".staging-";
 const TRASH: &str = ".trash-";
 pub(crate) const LOCK: &str = "lock";
+/// Held while a machine's settings are changed.
+const CONFIG_LOCK: &str = "config.lock";
 
 impl Store {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -187,8 +225,30 @@ impl Store {
         Ok(names)
     }
 
-    /// Held while the set of machines changes.
-    fn lock(&self) -> Result<Lock> {
+    /// The folders of the machines, with their names, and of those that are being created,
+    /// without one.
+    pub(crate) fn folders(&self) -> Vec<(PathBuf, Option<String>)> {
+        let Ok(entries) = std::fs::read_dir(self.machines()) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if check_name(&name).is_ok() {
+                    Some((entry.path(), Some(name)))
+                } else if name.starts_with(STAGING) {
+                    Some((entry.path(), None))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Held while the set of machines changes, and while layers are added or removed.
+    pub(crate) fn lock(&self) -> Result<Lock> {
         std::fs::create_dir_all(self.machines()).at("create", &self.machines())?;
         let path = self.root.join(LOCK);
         Lock::take(&path).at("lock", &path)

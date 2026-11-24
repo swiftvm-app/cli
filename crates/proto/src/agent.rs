@@ -5,6 +5,7 @@
 //! [`Answer`]. After a yes, what follows depends on the job:
 //!
 //! - [`Job::Info`] and [`Job::SetClock`]: nothing. The answer is all.
+//! - [`Job::Freeze`]: nothing, until the host hangs up.
 //! - [`Job::Exec`], [`Job::CopyIn`], [`Job::CopyOut`] and [`Job::Update`]: frames both ways,
 //!   up to the agent's [`Kind::End`]. The host calls a job off by hanging up.
 //! - [`Job::Tunnel`]: the bytes of a TCP connection in the guest, both ways.
@@ -69,6 +70,12 @@ pub enum Job {
     /// ends once the connection is closed, and the system starts the new one.
     Update {
         size: u64,
+    },
+    /// Writes out what the guest's root file system holds and keeps it from changing, so that
+    /// its disk can be taken as it is. The answer says when that is so. The file system is
+    /// thawed once the host hangs up, or after `seconds` whatever happens.
+    Freeze {
+        seconds: u64,
     },
 }
 

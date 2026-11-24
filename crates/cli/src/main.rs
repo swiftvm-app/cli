@@ -3,6 +3,7 @@
 mod console;
 mod disk;
 mod guest;
+mod image;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -16,8 +17,12 @@ fn usage() -> String {
     format!(
         "usage: {NAME} <command> [options]
 
-  images                     The systems a machine can be created with.
-  create <image>             Create a machine. It isn't started.
+  images                     The images a machine can be created from: the catalog's, and
+                             those made from machines.
+      --all                  Also the automatic ones.
+  create <image>             Create a machine. It isn't started. A machine of a catalog image
+                             with setup scripts starts from the automatic image that the first
+                             one with the same scripts and account left, and skips them.
       --name <name>          Its name. Without one it is named after the image.
       --cpus <count>         Processors. 4 unless this computer has fewer.
       --memory <size>        Memory, such as 4G or 512M. 4G unless said.
@@ -54,6 +59,24 @@ fn usage() -> String {
                              of the guest, until stopped.
   tunnel <machine> <port>    Connect this program's input and output to a port of the guest, as
                              ssh's ProxyCommand does.
+  snapshot <machine> <name>  Take a snapshot of the machine's disk. A running machine is shut
+                             down for it, and started again.
+  snapshots <machine>        The machine's snapshots.
+  revert <machine> <name>    Put the disk back as it was at a snapshot. What was written since
+                             is lost. A running machine is shut down for it, and started again.
+  delete-snapshot <machine> <name>
+                             Forget a snapshot.
+  image save <machine> <name>
+                             Make an image of a machine, which machines can be created from
+                             with their own host name, machine ID and SSH keys. A running
+                             machine is shut down for it, and started again.
+      --delete               Delete the machine once the image is made.
+  image delete <image>       Delete an image made from a machine. Not while machines use it.
+  image rename <image> <name>
+  image export <image> <file>
+                             Write an image made from a machine to one file.
+  image import <file>        Read an image that was exported.
+      --name <name>          Its name here. The one it had unless said.
   disk info <machine>        The layers of a machine's disk, and what each holds. Takes the path
                              of a .layer file too.
   disk check <machine>       Read every layer of a stopped machine's disk back and check it. Ends
@@ -229,8 +252,24 @@ fn print_table(rows: &[Vec<String>]) {
     }
 }
 
-/// Shows how far a creation has come, on the error output so that the result stays clean.
+/// How long ago a moment in seconds since 1970 was, roughly.
+fn ago(seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let past = now.saturating_sub(seconds);
+    match past {
+        0..60 => "just now".into(),
+        60..7200 => format!("{} minutes ago", past / 60),
+        7200..172_800 => format!("{} hours ago", past / 3600),
+        _ => format!("{} days ago", past / 86400),
+    }
+}
+
+/// Shows how far a long task has come, on the error output so that the result stays clean.
 struct Meter {
+    /// Nothing is shown: the result is JSON.
+    quiet: bool,
     /// A terminal gets a line that is kept up to date, anything else one line for each step.
     live: bool,
     step: Option<&'static str>,
@@ -238,7 +277,19 @@ struct Meter {
 }
 
 impl Meter {
+    fn new(quiet: bool) -> Self {
+        Self {
+            quiet,
+            live: std::io::stderr().is_terminal(),
+            step: None,
+            shown: Instant::now(),
+        }
+    }
+
     fn show(&mut self, progress: Progress) {
+        if self.quiet {
+            return;
+        }
         let (step, detail) = match progress {
             Progress::Downloading {
                 received,
@@ -259,6 +310,10 @@ impl Meter {
             Progress::WritingDisk { fraction } => {
                 ("Preparing the image", format!("{:.0}%", fraction * 100.0))
             }
+            Progress::Compressing { fraction } => {
+                ("Compressing the disk", format!("{:.0}%", fraction * 100.0))
+            }
+            Progress::Importing { fraction } => ("Importing the image", format!("{:.0}%", fraction * 100.0)),
         };
         let is_new = self.step != Some(step);
         self.step = Some(step);
@@ -321,21 +376,10 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
         }
     };
     let result = match command {
-        "images" => {
-            Arguments::parse(words, &[], &[])?.nothing_else()?;
-            let images = Host::open()?.images();
-            if !json {
-                let mut rows = vec![["IMAGE", "SYSTEM", "DOWNLOADED"].map(String::from).to_vec()];
-                rows.extend(images.iter().map(|image| {
-                    vec![
-                        image.id.clone(),
-                        image.name.clone(),
-                        if image.cached { "yes" } else { "no" }.to_string(),
-                    ]
-                }));
-                print_table(&rows);
-            }
-            Ok(json!({ "images": images }))
+        "images" => return image::list(words, json),
+        "image" => return image::run(words, json),
+        "snapshot" | "snapshots" | "revert" | "delete-snapshot" => {
+            return image::snapshots(command, words, json);
         }
         "create" => {
             let arguments = Arguments::parse(
@@ -354,16 +398,8 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 scripts: arguments.values("script"),
             };
             let host = Host::open()?;
-            let mut meter = Meter {
-                live: std::io::stderr().is_terminal(),
-                step: None,
-                shown: Instant::now(),
-            };
-            let created = host.create(options, &mut |progress| {
-                if !json {
-                    meter.show(progress);
-                }
-            });
+            let mut meter = Meter::new(json);
+            let created = host.create(options, &mut |progress| meter.show(progress));
             meter.finish();
             let machine = created?;
             say(format!("Created {}.", machine.name));

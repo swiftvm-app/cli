@@ -1,0 +1,17 @@
+# Gives a machine that @NAME@ made from an image a machine ID of its own, early in its first start:
+# before the services that read it, and after cloud-init has said which instance this is. cloud-init
+# gives it the rest of its identity. Installed by @NAME@ when the machine was created.
+[Unit]
+Description=@NAME@ machine identity
+DefaultDependencies=no
+After=cloud-init-local.service systemd-remount-fs.service
+Before=sysinit.target network-pre.target systemd-journal-flush.service cloud-init.service
+RequiresMountsFor=/etc /var/lib
+ConditionPathExists=/usr/local/lib/@NAME@/agent
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/@NAME@/agent identity
+
+[Install]
+WantedBy=sysinit.target

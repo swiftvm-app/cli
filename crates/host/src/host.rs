@@ -15,9 +15,10 @@ use crate::images::{self, ARCH};
 use crate::lock::Lock;
 use crate::paths::socket_path;
 use crate::process::SEED_FILE;
+use crate::saved::{self, ImageKind, SavedImage};
 use crate::scripts::Script;
 use crate::seed::{self, Seed};
-use crate::store::{self, Config, DiskConfig, DiskFormat, LOCK, Store};
+use crate::store::{self, Automatic, Config, DiskConfig, DiskFormat, LOCK, Snapshot, Store};
 use crate::{
     AGENT, Context, Error, ErrorCode, NAME, Result, client, download, guest, layers, now, random_hex,
 };
@@ -27,6 +28,18 @@ const DEFAULT_CPUS: u32 = 4;
 const DEFAULT_MEMORY: u64 = 4 << 30;
 const DEFAULT_DISK: u64 = 32 << 30;
 const SMALLEST_MEMORY: u64 = 256 << 20;
+/// How hard an image made from a machine is compressed: it is made once, and kept and copied.
+const SAVE_LEVEL: i32 = 19;
+/// The name of an image's description in a file it is exported to.
+const EXPORTED_NOTE: &str = "image.json";
+/// The name of its layer there.
+const EXPORTED_LAYER: &str = "image.layer";
+
+/// What a machine is created from.
+enum Source {
+    Catalog(images::Image),
+    Saved(SavedImage),
+}
 
 pub struct Host {
     store: Store,
@@ -78,6 +91,10 @@ pub enum Progress {
     /// The image is being made into the layer that its machines' disks are built on, from 0 to
     /// 1. That is done once for each image.
     WritingDisk { fraction: f64 },
+    /// A machine's disk is being compressed into an image, from 0 to 1.
+    Compressing { fraction: f64 },
+    /// An image is being read from a file, from 0 to 1.
+    Importing { fraction: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -117,12 +134,36 @@ pub struct Machine {
     pub created: u64,
 }
 
-/// An image of the catalog, and whether it has been downloaded.
+/// An image that machines can be created from.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageSummary {
+    /// What `create` is given.
     pub id: String,
+    /// The system, for an image of the catalog. What it was made of, for one made from a machine.
     pub name: String,
+    pub kind: ImageKind,
+    /// It is on this computer: downloaded, or made here.
     pub cached: bool,
+    /// What its layer takes up on this computer, in bytes. Only for one made from a machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The account that its machines have. Only for one made from a machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Seconds since 1970. Only for one made from a machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+}
+
+/// A snapshot of a machine's disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    /// Seconds since 1970.
+    pub created: u64,
+    /// What it holds that the layers under it don't, as it takes up room on this computer, in
+    /// bytes.
+    pub size: u64,
 }
 
 /// A disk, as its layers: its own first, then those it is built on.
@@ -185,6 +226,43 @@ pub struct LayerCheck {
     pub path: PathBuf,
     /// What is wrong with it: nothing, for a layer that is whole.
     pub problems: Vec<String>,
+}
+
+/// A machine that is held stopped, by its lock.
+struct Held {
+    directory: PathBuf,
+    config: Config,
+    /// Its own layer.
+    top: PathBuf,
+    lock: Lock,
+    was_running: bool,
+}
+
+fn no_snapshot(name: &str, snapshot: &str) -> Error {
+    Error::new(
+        ErrorCode::NotFound,
+        format!("\"{name}\" has no snapshot called \"{snapshot}\"."),
+    )
+}
+
+fn no_image(image: &str) -> Error {
+    Error::new(
+        ErrorCode::NotFound,
+        format!("There is no image called \"{image}\"."),
+    )
+}
+
+/// What is wrong with `name` as a snapshot's name.
+fn check_snapshot_name(name: &str) -> Result<()> {
+    store::check_name(name).map_err(|_| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "\"{name}\" can't be a snapshot's name. Use 1 to 63 lowercase letters, digits and \"-\", \
+                 with a letter or a digit first and last."
+            ),
+        )
+    })
 }
 
 /// The hash that a sealed layer's file is named by.
@@ -299,16 +377,39 @@ impl Host {
         &self.store
     }
 
-    /// The images that a machine can be created with on this computer.
-    pub fn images(&self) -> Vec<ImageSummary> {
-        images::catalog()
+    /// The images that a machine can be created with on this computer: the catalog's, then those
+    /// made from machines. Automatic ones only with `all`.
+    pub fn images(&self, all: bool) -> Vec<ImageSummary> {
+        let mut found: Vec<ImageSummary> = images::catalog()
             .into_iter()
             .map(|image| ImageSummary {
                 cached: download::cached(&self.cache, &image).is_some(),
                 id: image.id,
                 name: image.name,
+                kind: ImageKind::Catalog,
+                size: None,
+                user: None,
+                created: None,
             })
-            .collect()
+            .collect();
+        found.extend(
+            saved::all(&self.store)
+                .into_iter()
+                .filter(|image| all || image.kind != ImageKind::Automatic)
+                .map(|image| {
+                    let layer = image.hash().ok().map(|hash| layers::path(&self.store, &hash));
+                    ImageSummary {
+                        name: image.description(),
+                        cached: layer.as_ref().is_some_and(|layer| layer.is_file()),
+                        size: layer.as_deref().map(allocated),
+                        id: image.name,
+                        kind: image.kind,
+                        user: Some(image.user),
+                        created: Some(image.created),
+                    }
+                }),
+        );
+        found
     }
 
     pub fn list(&self) -> Result<Vec<Machine>> {
@@ -323,10 +424,29 @@ impl Host {
         Ok(summary(&self.store, &self.store.find(name)?, name))
     }
 
+    /// The image called `name`: of the catalog, or one made from a machine.
+    fn source(&self, name: &str) -> Result<Source> {
+        let catalog = images::find(name);
+        if let Ok(image) = catalog {
+            return Ok(Source::Catalog(image));
+        }
+        match saved::find(&self.store, name)? {
+            Some(image) => Ok(Source::Saved(image)),
+            None => Err(Error::new(
+                ErrorCode::NotFound,
+                format!("There is no image called \"{name}\". `{NAME} images` lists them."),
+            )),
+        }
+    }
+
     /// Creates a machine, downloading its image unless the cache has it. The machine isn't
     /// started.
+    ///
+    /// A machine of a catalog image with setup scripts starts from the automatic image that the
+    /// first machine of that image, those scripts and that account left, when there is one: its
+    /// scripts have run already.
     pub fn create(&self, options: CreateOptions, progress: &mut dyn FnMut(Progress)) -> Result<Machine> {
-        let image = images::find(&options.image)?;
+        let source = self.source(&options.image)?;
         if let Some(name) = &options.name {
             store::check_name(name)?;
             // Said now rather than after the download. Whether it is still so is seen at the end.
@@ -334,11 +454,6 @@ impl Host {
                 return Err(store::already_exists(name));
             }
         }
-        let user = match options.user {
-            Some(user) => user,
-            None => seed::user_from(&std::env::var("USER").unwrap_or_default()),
-        };
-        seed::check_user(&user)?;
         let scripts = options
             .scripts
             .iter()
@@ -357,38 +472,125 @@ impl Host {
             return invalid("A machine needs at least 256 MiB of memory.");
         }
         // Whole mebibytes: a disk's size has to be a number of sectors, whatever their size.
-        let Some(disk) = options
-            .disk
-            .unwrap_or(DEFAULT_DISK)
-            .checked_next_multiple_of(1 << 20)
-        else {
-            return invalid("The disk is too large.");
+        let asked = match options.disk.map(|disk| disk.checked_next_multiple_of(1 << 20)) {
+            Some(None) => return invalid("The disk is too large."),
+            Some(Some(disk)) => Some(disk),
+            None => None,
         };
 
-        let file = download::fetch(&self.cache, &image, &mut |received, total| {
-            progress(Progress::Downloading { received, total })
-        })?;
-        let base = layers::base(&self.store, &image, &file, &mut |fraction| {
-            progress(Progress::WritingDisk { fraction })
-        })?;
-        let base_size = disk::Header::read(&layers::path(&self.store, &base))
-            .at("read", &layers::path(&self.store, &base))?
+        // The sealed layer that the machine's disk is built on, and whether the system on it has
+        // run before as another machine.
+        let (parent, user, disk, automatic, copy) = match &source {
+            Source::Saved(image) => {
+                if image.arch != ARCH {
+                    return Err(Error::new(
+                        ErrorCode::Unsupported,
+                        format!(
+                            "\"{}\" was made for {} processors, and this computer's is {ARCH}.",
+                            image.name, image.arch
+                        ),
+                    ));
+                }
+                if !scripts.is_empty() {
+                    return Err(Error::new(
+                        ErrorCode::Unsupported,
+                        "Setup scripts run on machines of the catalog's images. Run them in this one with exec once it has started.",
+                    ));
+                }
+                if options.user.as_ref().is_some_and(|user| *user != image.user) {
+                    return Err(Error::new(
+                        ErrorCode::InvalidArgument,
+                        format!(
+                            "Machines made from \"{}\" have its account, \"{}\".",
+                            image.name, image.user
+                        ),
+                    ));
+                }
+                // The note may come from another computer: what it says is checked.
+                seed::check_user(&image.user)?;
+                let parent = image.hash()?;
+                let disk = asked.unwrap_or(image.disk_size);
+                (parent, image.user.clone(), disk, None, true)
+            }
+            Source::Catalog(image) => {
+                let user = match &options.user {
+                    Some(user) => user.clone(),
+                    None => seed::user_from(&std::env::var("USER").unwrap_or_default()),
+                };
+                seed::check_user(&user)?;
+                let disk = asked.unwrap_or(DEFAULT_DISK);
+                let file = download::fetch(&self.cache, image, &mut |received, total| {
+                    progress(Progress::Downloading { received, total })
+                })?;
+                let base = layers::base(&self.store, image, &file, &mut |fraction| {
+                    progress(Progress::WritingDisk { fraction })
+                })?;
+                if scripts.is_empty() {
+                    (base, user, disk, None, false)
+                } else {
+                    let key = saved::automatic_key(&base, &scripts, &user);
+                    let made = saved::find(&self.store, &saved::automatic_name(&key))?.filter(|made| {
+                        made.key.as_deref() == Some(key.as_str())
+                            && made.arch == ARCH
+                            && made
+                                .hash()
+                                .is_ok_and(|hash| layers::path(&self.store, &hash).is_file())
+                    });
+                    match made {
+                        Some(made) if made.disk_size <= disk => (made.hash()?, user, disk, None, true),
+                        // One for a larger disk: this machine installs, and its disk doesn't
+                        // become another of the same kind.
+                        Some(_) => (base, user, disk, None, false),
+                        None => {
+                            let automatic = Automatic {
+                                key,
+                                scripts: scripts.iter().map(|script| script.name.clone()).collect(),
+                            };
+                            (base, user, disk, Some(automatic), false)
+                        }
+                    }
+                }
+            }
+        };
+        let parent_path = layers::path(&self.store, &parent);
+        let parent_size = disk::Header::read(&parent_path)
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "The image's layer {} can't be read: {error}.",
+                        parent_path.display()
+                    ),
+                )
+            })?
             .capacity;
-        if base_size > disk {
+        if parent_size > disk {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
-                format!("The image needs a disk of {base_size} bytes, and {disk} were asked for."),
+                format!("The image needs a disk of {parent_size} bytes, and {disk} were asked for."),
             ));
         }
         let mut staged = self.store.stage()?;
         // The guest grows its system into the room that is left when it first starts.
         let layer = staged.directory.join(DISK_FILE);
-        disk::Layer::create(&layer, disk, Some(base)).at("create", &layer)?;
+        disk::Layer::create(&layer, disk, Some(parent)).at("create", &layer)?;
+        // An image deleted in the meantime took its layer along. With the store's lock held, a
+        // sweep has either removed it already, or sees the new disk that is built on it.
+        let gone = {
+            let _changing = self.store.lock()?;
+            !parent_path.is_file()
+        };
+        if gone {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("The image \"{}\" was deleted in the meantime.", options.image),
+            ));
+        }
         let mut config = Config {
             version: store::CONFIG_VERSION,
             id: random_hex(16)?,
             name: String::new(),
-            image: image.id.clone(),
+            image: options.image.clone(),
             arch: ARCH.to_string(),
             cpus,
             memory,
@@ -400,11 +602,13 @@ impl Host {
             mac_address: mac_address()?,
             user,
             created: now(),
+            snapshots: Vec::new(),
+            automatic,
         };
 
         // A machine without a name is called after its image: debian-13, debian-13-2 and so on.
-        let base: String = image
-            .id
+        let base: String = options
+            .image
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
@@ -427,7 +631,8 @@ impl Host {
                 password: options.password.as_deref(),
                 mac_address: &config.mac_address,
                 agent: AGENT,
-                scripts: &scripts,
+                // A system that has run before has run its scripts.
+                scripts: if copy { &[] } else { &scripts },
             };
             seed.write(&staged.directory.join(SEED_FILE))?;
             config.save(&staged.directory)?;
@@ -526,19 +731,490 @@ impl Host {
                 ));
             }
         };
+        self.remove(&directory, stopped)
+    }
+
+    /// Removes the machine in `directory`, which `stopped` keeps from starting, and the layers
+    /// that only it used.
+    fn remove(&self, directory: &Path, stopped: Lock) -> Result<()> {
         // Sockets that had no room in the machine's folder aren't removed with it.
-        if let Some(process) = client::process_file(&directory)
-            && !process.socket.starts_with(&directory)
+        if let Some(process) = client::process_file(directory)
+            && !process.socket.starts_with(directory)
         {
             _ = std::fs::remove_file(process.socket);
         }
-        if let Ok(config) = Config::load(&directory)
-            && let Ok(socket) = socket_path(&directory, &config.id, "disk")
-            && !socket.starts_with(&directory)
+        if let Ok(config) = Config::load(directory)
+            && let Ok(socket) = socket_path(directory, &config.id, "disk")
+            && !socket.starts_with(directory)
         {
             _ = std::fs::remove_file(socket);
         }
-        self.store.remove(&directory, stopped)
+        self.store.remove(directory, stopped)?;
+        // The machine is gone either way. What it leaves goes with the next sweep.
+        _ = layers::sweep(&self.store);
+        Ok(())
+    }
+
+    /// Shuts the machine down if it runs, and holds its lock so that it doesn't start until the
+    /// lock is let go of. Says what the machine is made of, and whether it was running.
+    fn hold_stopped(&self, name: &str) -> Result<Held> {
+        let directory = self.store.find(name)?;
+        let config = Config::load(&directory)?;
+        if config.disk.format != DiskFormat::Layer {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                format!("\"{name}\" has a raw disk, which has no layers."),
+            ));
+        }
+        let was_running = running_process(&directory).is_some();
+        if was_running {
+            client::stop(&directory, false, None)?;
+        }
+        let lock = directory.join(LOCK);
+        let stopped = Lock::take_within(&lock, Duration::from_secs(10))
+            .or_else(|error| {
+                self.store.find(name)?;
+                Err(error).at("lock", &lock)
+            })?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Running,
+                    format!("\"{name}\" is being started or deleted by someone else."),
+                )
+            })?;
+        // While the lock was waited for, a deletion may have taken the folder away.
+        self.store.find(name)?;
+        let config = Config::load(&directory)?;
+        let top = directory.join(&config.disk.file);
+        layers::recover(&self.store, &top)?;
+        Ok(Held {
+            directory,
+            config,
+            top,
+            lock: stopped,
+            was_running,
+        })
+    }
+
+    /// Lets go of a machine that was held stopped, and starts it again if it was running.
+    fn release(&self, name: &str, held: Held) -> Result<()> {
+        drop(held.lock);
+        if held.was_running {
+            self.start(name)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of a machine that was held stopped for something that came out as `result`, and
+    /// starts it again if it was running, whether that worked or not.
+    fn release_after<T>(&self, name: &str, held: Held, result: Result<T>) -> Result<T> {
+        let released = self.release(name, held);
+        let value = result?;
+        released?;
+        Ok(value)
+    }
+
+    /// Seals the machine's disk as it is, as a snapshot it can go back to. A machine that is
+    /// running is shut down for it, and started again.
+    pub fn snapshot(&self, name: &str, snapshot: &str) -> Result<SnapshotInfo> {
+        check_snapshot_name(snapshot)?;
+        let taken_already = |config: &Config| {
+            if config.snapshots.iter().any(|taken| taken.name == snapshot) {
+                return Err(Error::new(
+                    ErrorCode::AlreadyExists,
+                    format!("\"{name}\" has a snapshot called \"{snapshot}\" already."),
+                ));
+            }
+            Ok(())
+        };
+        taken_already(&Config::load(&self.store.find(name)?)?)?;
+        let held = self.hold_stopped(name)?;
+        let taken = (|| {
+            taken_already(&held.config)?;
+            let hash = layers::seal_top(&self.store, &held.top)?;
+            let taken = Snapshot {
+                name: snapshot.to_string(),
+                layer: disk::layer::to_hex(&hash),
+                created: now(),
+            };
+            Config::update(&held.directory, |config| {
+                taken_already(config)?;
+                config.snapshots.push(taken.clone());
+                Ok(())
+            })?;
+            Ok(taken)
+        })();
+        self.release_after(name, held, taken)
+            .map(|taken| self.snapshot_info(&taken))
+    }
+
+    fn snapshot_info(&self, snapshot: &Snapshot) -> SnapshotInfo {
+        SnapshotInfo {
+            name: snapshot.name.clone(),
+            created: snapshot.created,
+            size: disk::layer::from_hex(&snapshot.layer)
+                .map_or(0, |hash| allocated(&layers::path(&self.store, &hash))),
+        }
+    }
+
+    /// The machine's snapshots, oldest first.
+    pub fn snapshots(&self, name: &str) -> Result<Vec<SnapshotInfo>> {
+        let config = Config::load(&self.store.find(name)?)?;
+        Ok(config
+            .snapshots
+            .iter()
+            .map(|snapshot| self.snapshot_info(snapshot))
+            .collect())
+    }
+
+    fn find_snapshot(&self, name: &str, snapshot: &str) -> Result<Snapshot> {
+        let config = Config::load(&self.store.find(name)?)?;
+        config
+            .snapshots
+            .into_iter()
+            .find(|taken| taken.name == snapshot)
+            .ok_or_else(|| no_snapshot(name, snapshot))
+    }
+
+    /// Puts the machine's disk back as it was when the snapshot was taken. What was written since
+    /// is lost; the machine's other snapshots stay. A machine that is running is shut down for
+    /// it, and started again.
+    pub fn revert(&self, name: &str, snapshot: &str) -> Result<()> {
+        self.find_snapshot(name, snapshot)?;
+        let held = self.hold_stopped(name)?;
+        let reverted = (|| {
+            // Looked up again, now that nobody else can change the machine's disk: the snapshot
+            // may have been deleted in the meantime.
+            let taken = held
+                .config
+                .snapshots
+                .iter()
+                .find(|taken| taken.name == snapshot)
+                .ok_or_else(|| no_snapshot(name, snapshot))?;
+            let hash = disk::layer::from_hex(&taken.layer).ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Io,
+                    format!("The snapshot \"{snapshot}\" names no layer it can be found by."),
+                )
+            })?;
+            // With the store's lock held, so that a sweep sees the new layer once its layer is
+            // checked, or has removed it before.
+            let _changing = self.store.lock()?;
+            let sealed = layers::path(&self.store, &hash);
+            if !sealed.is_file() {
+                return Err(Error::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "The layer of the snapshot \"{snapshot}\" is missing: {}.",
+                        sealed.display()
+                    ),
+                ));
+            }
+            let mut next = held.top.as_os_str().to_owned();
+            next.push(".new");
+            let next = PathBuf::from(next);
+            _ = std::fs::remove_file(&next);
+            disk::Layer::create(&next, held.config.disk.size, Some(hash)).at("create", &next)?;
+            std::fs::rename(&next, &held.top).at("write", &held.top)?;
+            layers::sync_folder(&held.directory)
+        })();
+        self.release_after(name, held, reverted)?;
+        _ = layers::sweep(&self.store);
+        Ok(())
+    }
+
+    /// Forgets a snapshot. Its layer stays for as long as the disk is built on it.
+    pub fn delete_snapshot(&self, name: &str, snapshot: &str) -> Result<()> {
+        let directory = self.store.find(name)?;
+        Config::update(&directory, |config| {
+            if !config.snapshots.iter().any(|taken| taken.name == snapshot) {
+                return Err(no_snapshot(name, snapshot));
+            }
+            config.snapshots.retain(|taken| taken.name != snapshot);
+            Ok(())
+        })?;
+        _ = layers::sweep(&self.store);
+        Ok(())
+    }
+
+    /// Makes an image called `image` of the machine's disk: its layers in one, compressed
+    /// harder. A machine that is running is shut down for it, and started again unless `delete`
+    /// says to delete it once the image is made. An image that can't be made deletes nothing.
+    pub fn save_image(
+        &self,
+        name: &str,
+        image: &str,
+        delete: bool,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<ImageSummary> {
+        saved::check_new_name(&self.store, image)?;
+        let held = self.hold_stopped(name)?;
+        let flattened = layers::flatten(&self.store, &held.top, SAVE_LEVEL, &mut |fraction| {
+            progress(Progress::Compressing { fraction })
+        });
+        let partial = match flattened {
+            Ok(partial) => partial,
+            Err(error) => return self.release_after(name, held, Err(error)),
+        };
+        let from = match images::find(&held.config.image) {
+            Ok(_) => held.config.image.clone(),
+            Err(_) => saved::find(&self.store, &held.config.image)
+                .ok()
+                .flatten()
+                .map_or_else(|| held.config.image.clone(), |made| made.from),
+        };
+        let published = (|| {
+            let _changing = self.store.lock()?;
+            // Someone may have taken the name while the disk was compressed.
+            saved::check_new_name(&self.store, image)?;
+            let hash = layers::publish(&self.store, &partial)?;
+            saved::write(
+                &self.store,
+                &SavedImage {
+                    name: image.to_string(),
+                    kind: ImageKind::Saved,
+                    layer: disk::layer::to_hex(&hash),
+                    arch: held.config.arch.clone(),
+                    user: held.config.user.clone(),
+                    disk_size: held.config.disk.size,
+                    from,
+                    scripts: Vec::new(),
+                    key: None,
+                    created: now(),
+                },
+            )
+        })();
+        if let Err(error) = published {
+            _ = std::fs::remove_file(&partial);
+            // The machine stays as it was, running again if it was.
+            return self.release_after(name, held, Err(error));
+        }
+        if delete {
+            self.remove(&held.directory, held.lock)?;
+        } else {
+            self.release(name, held)?;
+        }
+        self.image_summary(image)
+    }
+
+    fn image_summary(&self, image: &str) -> Result<ImageSummary> {
+        self.images(true)
+            .into_iter()
+            .find(|summary| summary.id == image)
+            .ok_or_else(|| no_image(image))
+    }
+
+    /// An image made from a machine, which can be changed.
+    fn own_image(&self, image: &str) -> Result<SavedImage> {
+        if images::find(image).is_ok() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!("\"{image}\" is an image of the catalog, which can't be changed."),
+            ));
+        }
+        saved::find(&self.store, image)?.ok_or_else(|| no_image(image))
+    }
+
+    /// Deletes an image made from a machine. One that machines are built on is kept.
+    pub fn delete_image(&self, image: &str) -> Result<()> {
+        let found = self.own_image(image)?;
+        let hash = found.hash()?;
+        {
+            let _changing = self.store.lock()?;
+            let machines = layers::dependents(&self.store, &hash);
+            if !machines.is_empty() {
+                return Err(Error::new(
+                    ErrorCode::InUse,
+                    format!(
+                        "The image \"{image}\" is in use by {}. Delete them first.",
+                        machines.join(", ")
+                    ),
+                ));
+            }
+            saved::remove(&self.store, image)?;
+        }
+        _ = layers::sweep(&self.store);
+        Ok(())
+    }
+
+    /// Gives an image made from a machine another name. An automatic one keeps its own: it is
+    /// found by it.
+    pub fn rename_image(&self, image: &str, name: &str) -> Result<ImageSummary> {
+        let found = self.own_image(image)?;
+        if found.kind == ImageKind::Automatic {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "An automatic image keeps its name. Save a machine made from it as an image of its own.",
+            ));
+        }
+        {
+            let _changing = self.store.lock()?;
+            saved::check_new_name(&self.store, name)?;
+            saved::rename(&self.store, &found, name)?;
+        }
+        self.image_summary(name)
+    }
+
+    /// Writes an image made from a machine to one file, for another computer to import.
+    pub fn export_image(&self, image: &str, file: &Path) -> Result<()> {
+        let found = self.own_image(image)?;
+        let layer = layers::path(&self.store, &found.hash()?);
+        let mut partial = file.as_os_str().to_owned();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let written = (|| -> std::io::Result<()> {
+            let output = std::fs::File::create(&partial)?;
+            let mut builder = tar::Builder::new(std::io::BufWriter::new(output));
+            let note = serde_json::to_vec_pretty(&SavedImage {
+                kind: ImageKind::Saved,
+                key: None,
+                ..found.clone()
+            })
+            .expect("plain data");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(note.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(found.created);
+            header.set_cksum();
+            builder.append_data(&mut header, EXPORTED_NOTE, note.as_slice())?;
+            let mut source = std::fs::File::open(&layer)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(source.metadata()?.len());
+            header.set_mode(0o644);
+            header.set_mtime(found.created);
+            header.set_cksum();
+            builder.append_data(&mut header, EXPORTED_LAYER, &mut source)?;
+            builder
+                .into_inner()?
+                .into_inner()
+                .map_err(|error| error.into_error())?
+                .sync_all()
+        })();
+        if let Err(error) = written {
+            _ = std::fs::remove_file(&partial);
+            return Err(error).at("write", file);
+        }
+        std::fs::rename(&partial, file).at("write", file)
+    }
+
+    /// Reads an image that another computer exported, under `name`, or the name it had there.
+    pub fn import_image(
+        &self,
+        file: &Path,
+        name: Option<&str>,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<ImageSummary> {
+        let not_an_image = |why: &str| {
+            Error::new(
+                ErrorCode::Image,
+                format!("{} isn't an image that {NAME} exported: {why}.", file.display()),
+            )
+        };
+        let input = std::fs::File::open(file).at("read", file)?;
+        let total = input.metadata().at("read", file)?.len();
+        let mut archive = tar::Archive::new(std::io::BufReader::new(input));
+        let mut entries = archive.entries().at("read", file)?;
+        let mut next = |expected: &str| -> Result<tar::Entry<'_, std::io::BufReader<std::fs::File>>> {
+            let entry = entries
+                .next()
+                .ok_or_else(|| not_an_image(&format!("it has no {expected}")))?
+                .at("read", file)?;
+            if entry.path().ok().as_deref() != Some(Path::new(expected)) {
+                return Err(not_an_image(&format!("{expected} isn't where it should be")));
+            }
+            Ok(entry)
+        };
+        let mut note_entry = next(EXPORTED_NOTE)?;
+        let mut note = Vec::new();
+        (&mut note_entry)
+            .take(1 << 20)
+            .read_to_end(&mut note)
+            .at("read", file)?;
+        drop(note_entry);
+        let note: SavedImage =
+            serde_json::from_slice(&note).map_err(|error| not_an_image(&error.to_string()))?;
+        if note.arch != ARCH {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                format!(
+                    "The image was made for {} processors, and this computer's is {ARCH}.",
+                    note.arch
+                ),
+            ));
+        }
+        // The rest of what the file says is checked too: it comes from someone else.
+        let mut note = note;
+        seed::check_user(&note.user).map_err(|_| not_an_image("its account's name can't be used"))?;
+        if note.disk_size == 0 || !note.disk_size.is_multiple_of(1 << 20) {
+            return Err(not_an_image("its disk's size isn't a number of mebibytes"));
+        }
+        note.from = crate::scripts::line(&note.from, 120);
+        note.scripts = note
+            .scripts
+            .iter()
+            .map(|script| crate::scripts::line(script, 120))
+            .collect();
+        let expected = note.hash()?;
+        let name = name.unwrap_or(&note.name).to_string();
+        saved::check_new_name(&self.store, &name)?;
+
+        let folder = layers::directory(&self.store);
+        std::fs::create_dir_all(&folder).at("create", &folder)?;
+        let partial = folder.join(format!(".import-{}.layer", random_hex(8)?));
+        let result = (|| {
+            let mut layer = next(EXPORTED_LAYER)?;
+            let mut output = std::fs::File::create(&partial).at("create", &partial)?;
+            let mut buffer = vec![0; 1 << 20];
+            let mut copied = 0u64;
+            loop {
+                let count = layer.read(&mut buffer).at("read", file)?;
+                if count == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..count]).at("write", &partial)?;
+                copied += count as u64;
+                progress(Progress::Importing {
+                    fraction: copied as f64 / total.max(1) as f64,
+                });
+            }
+            drop(output);
+            let header = disk::Header::read(&partial).map_err(|error| not_an_image(&error.to_string()))?;
+            if !header.sealed || header.parent.is_some() {
+                return Err(not_an_image("its layer isn't one sealed layer of its own"));
+            }
+            if header.capacity > note.disk_size {
+                return Err(not_an_image("its layer is larger than its disk"));
+            }
+            if disk::layer::hash_file(&partial).at("read", &partial)? != expected {
+                return Err(not_an_image("its layer was damaged on the way"));
+            }
+            let opened = disk::Layer::open(&partial, &disk::Options::read_only(), None)
+                .map_err(|error| not_an_image(&error.to_string()))?;
+            let problems = opened.verify().at("read", &partial)?;
+            if let Some(problem) = problems.first() {
+                return Err(not_an_image(&format!("its layer is damaged: {problem}")));
+            }
+            drop(opened);
+            let _changing = self.store.lock()?;
+            saved::check_new_name(&self.store, &name)?;
+            let hash = layers::publish(&self.store, &partial)?;
+            saved::write(
+                &self.store,
+                &SavedImage {
+                    name: name.clone(),
+                    kind: ImageKind::Saved,
+                    layer: disk::layer::to_hex(&hash),
+                    key: None,
+                    ..note
+                },
+            )
+        })();
+        if let Err(error) = result {
+            _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
+        progress(Progress::Importing { fraction: 1.0 });
+        self.image_summary(&name)
     }
 
     /// A connection to the machine's serial console: what the guest prints comes out of it, and
@@ -801,5 +1477,208 @@ impl Host {
             checks.push(LayerCheck { path: file, problems });
         }
         Ok(DiskCheck { layers: checks })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use disk::Disk;
+
+    use super::*;
+
+    /// A host on a store of its own with a stopped machine `m`, whose disk holds 7s in its first
+    /// cluster on top of a sealed layer of 1s.
+    fn host(test: &str) -> Host {
+        let root = std::env::temp_dir().join(format!("host-{test}-{}", random_hex(4).unwrap()));
+        let host = Host {
+            store: Store::new(&root),
+            cache: root.join("cache"),
+            program: PathBuf::from("/nonexistent"),
+        };
+        let folder = layers::directory(&host.store);
+        std::fs::create_dir_all(&folder).unwrap();
+        let partial = folder.join(".base.layer");
+        disk::Layer::create(&partial, 4 << 20, None).unwrap();
+        let layer = disk::Layer::open(&partial, &disk::Options::default(), None).unwrap();
+        layer.write(0, &[1; 1 << 20]).unwrap();
+        layer.seal().unwrap();
+        drop(layer);
+        let base = layers::publish(&host.store, &partial).unwrap();
+        let mut staged = host.store.stage().unwrap();
+        let top = staged.directory.join(DISK_FILE);
+        disk::Layer::create(&top, 8 << 20, Some(base)).unwrap();
+        let layer = layers::open(&host.store, &top, &disk::Options::default()).unwrap();
+        layer.write(0, &[7; 65536]).unwrap();
+        layer.close().unwrap();
+        Config {
+            version: store::CONFIG_VERSION,
+            id: random_hex(16).unwrap(),
+            name: "m".into(),
+            image: "debian-13".into(),
+            arch: ARCH.into(),
+            cpus: 1,
+            memory: 1 << 30,
+            disk: DiskConfig {
+                file: DISK_FILE.into(),
+                format: DiskFormat::Layer,
+                size: 8 << 20,
+            },
+            mac_address: mac_address().unwrap(),
+            user: "username".into(),
+            created: now(),
+            snapshots: Vec::new(),
+            automatic: None,
+        }
+        .save(&staged.directory)
+        .unwrap();
+        host.store.publish(&mut staged, "m").unwrap();
+        host
+    }
+
+    fn contents(host: &Host, machine: &str) -> Vec<u8> {
+        let top = host.store.directory(machine).join(DISK_FILE);
+        let layer = layers::open(&host.store, &top, &disk::Options::read_only()).unwrap();
+        let mut read = vec![0; 8 << 20];
+        layer.read(0, &mut read).unwrap();
+        read
+    }
+
+    fn options(image: &str, name: &str) -> CreateOptions {
+        CreateOptions {
+            image: image.into(),
+            name: Some(name.into()),
+            ..CreateOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_machine_saved_as_an_image_gives_machines_with_its_disk() {
+        let host = host("save");
+        let original = contents(&host, "m");
+        let saved = host.save_image("m", "dev", false, &mut |_| {}).unwrap();
+        assert_eq!(saved.kind, ImageKind::Saved);
+        assert_eq!(saved.user.as_deref(), Some("username"));
+        assert_eq!(
+            host.save_image("m", "dev", false, &mut |_| {}).unwrap_err().code,
+            ErrorCode::AlreadyExists
+        );
+        assert_eq!(
+            host.save_image("m", "debian-13", false, &mut |_| {})
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+
+        let other_user = CreateOptions {
+            user: Some("someone".into()),
+            ..options("dev", "c")
+        };
+        assert_eq!(
+            host.create(other_user, &mut |_| {}).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let scripts = CreateOptions {
+            scripts: vec!["docker".into()],
+            ..options("dev", "c")
+        };
+        assert_eq!(
+            host.create(scripts, &mut |_| {}).unwrap_err().code,
+            ErrorCode::Unsupported
+        );
+        let small = CreateOptions {
+            disk: Some(1 << 20),
+            ..options("dev", "c")
+        };
+        assert_eq!(
+            host.create(small, &mut |_| {}).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let created = host.create(options("dev", "c"), &mut |_| {}).unwrap();
+        assert_eq!(
+            (created.image.as_str(), created.user.as_str()),
+            ("dev", "username")
+        );
+        assert_eq!(created.disk_size, 8 << 20);
+        assert_eq!(contents(&host, "c"), original);
+        // The machine it was made of is as it was.
+        assert_eq!(contents(&host, "m"), original);
+
+        assert_eq!(host.delete_image("dev").unwrap_err().code, ErrorCode::InUse);
+        assert_eq!(
+            host.delete_image("debian-13").unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            host.delete_image("nothing").unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        host.rename_image("dev", "web").unwrap();
+        assert!(host.images(false).iter().any(|image| image.id == "web"));
+        assert!(!host.images(false).iter().any(|image| image.id == "dev"));
+
+        let file = host.store.root().join("web.image");
+        host.export_image("web", &file).unwrap();
+        let imported = host.import_image(&file, Some("copy"), &mut |_| {}).unwrap();
+        assert_eq!(imported.id, "copy");
+        assert_eq!(
+            host.import_image(&file, Some("copy"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            ErrorCode::AlreadyExists
+        );
+        let junk = host.store.root().join("junk.image");
+        std::fs::write(&junk, b"not an image").unwrap();
+        assert!(host.import_image(&junk, Some("junk"), &mut |_| {}).is_err());
+
+        host.delete("c", false).unwrap();
+        host.delete_image("web").unwrap();
+        // The imported copy is the same layer, which stays for it.
+        host.create(options("copy", "d"), &mut |_| {}).unwrap();
+        assert_eq!(contents(&host, "d"), original);
+        host.delete("d", false).unwrap();
+        host.delete_image("copy").unwrap();
+        // Only the layer that m is built on is left.
+        let layers: Vec<_> = std::fs::read_dir(layers::directory(&host.store))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".layer"))
+            .collect();
+        assert_eq!(layers.len(), 1);
+        std::fs::remove_dir_all(host.store.root()).unwrap();
+    }
+
+    #[test]
+    fn snapshots_are_taken_reverted_to_and_forgotten() {
+        let host = host("snapshots");
+        let original = contents(&host, "m");
+        host.snapshot("m", "first").unwrap();
+        assert_eq!(
+            host.snapshot("m", "first").unwrap_err().code,
+            ErrorCode::AlreadyExists
+        );
+        assert_eq!(
+            host.snapshot("m", "Bad name").unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let top = host.store.directory("m").join(DISK_FILE);
+        let layer = layers::open(&host.store, &top, &disk::Options::default()).unwrap();
+        layer.write(0, &[9; 65536]).unwrap();
+        layer.close().unwrap();
+        assert_ne!(contents(&host, "m"), original);
+        host.snapshot("m", "second").unwrap();
+        let names: Vec<String> = host
+            .snapshots("m")
+            .unwrap()
+            .into_iter()
+            .map(|taken| taken.name)
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+
+        host.revert("m", "first").unwrap();
+        assert_eq!(contents(&host, "m"), original);
+        assert_eq!(host.revert("m", "third").unwrap_err().code, ErrorCode::NotFound);
+        host.delete_snapshot("m", "second").unwrap();
+        assert_eq!(host.snapshots("m").unwrap().len(), 1);
+        std::fs::remove_dir_all(host.store.root()).unwrap();
     }
 }

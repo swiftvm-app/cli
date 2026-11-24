@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use proto::agent::{Job, SetupState};
 use proto::{Request, Response, State, Status};
 use serde::{Deserialize, Serialize};
 
@@ -22,8 +23,9 @@ use crate::console::Console;
 use crate::engine::{self, DiskAttachment, Engine, Spec};
 use crate::lock::Lock;
 use crate::paths::socket_path;
-use crate::store::{Config, DiskFormat, LOCK, Store};
-use crate::{Context, Error, ErrorCode, Result, layers, now};
+use crate::saved::{self, ImageKind, SavedImage};
+use crate::store::{Automatic, Config, DiskFormat, LOCK, Store};
+use crate::{Context, Error, ErrorCode, Result, guest, layers, now};
 
 /// The first argument that makes the program a machine's process. The second is the machine's
 /// folder. A program that embeds this library passes both on to [`run`].
@@ -198,10 +200,17 @@ impl Service {
     }
 }
 
-/// A machine's disk of layers, served to its engine for as long as this lives.
+/// A machine's disk of layers, served to its engine until it is closed.
 struct ServedDisk {
-    server: disk::nbd::Server,
-    layer: Arc<disk::Layer>,
+    /// Taken when the disk is closed. Held while the layer is being sealed, which a close waits
+    /// for.
+    server: Mutex<Option<disk::nbd::Server>>,
+    /// Where the engine finds the disk.
+    url: String,
+    disk: Arc<disk::Switchable<disk::Layer>>,
+    store: Store,
+    /// The machine's own layer.
+    path: PathBuf,
 }
 
 impl ServedDisk {
@@ -218,21 +227,159 @@ impl ServedDisk {
                 )
             })?;
         let path = directory.join(&config.disk.file);
+        layers::recover(&store, &path)?;
         let layer = layers::open(&store, &path, &disk::Options::default())?;
+        let disk = Arc::new(disk::Switchable::new(layer));
         let socket = socket_path(directory, &config.id, "disk")?;
-        let server = disk::nbd::Server::start(layer.clone(), &socket).at("serve the disk on", &socket)?;
-        Ok(Self { server, layer })
+        let server = disk::nbd::Server::start(disk.clone(), &socket).at("serve the disk on", &socket)?;
+        Ok(Self {
+            url: server.url(),
+            server: Mutex::new(Some(server)),
+            disk,
+            store,
+            path,
+        })
+    }
+
+    /// Seals the layer that the guest writes to, makes it a layer of the store, and has the
+    /// guest write to a new one on top of it from then on. Returns the sealed layer's hash.
+    /// Called while the disk is held open.
+    fn seal(&self) -> Result<[u8; 32]> {
+        // Finishes what the seal left, as a start after a crash would, and opens the new layer.
+        let reopen = || {
+            layers::recover(&self.store, &self.path)
+                .and_then(|()| layers::open(&self.store, &self.path, &disk::Options::default()))
+                .map_err(std::io::Error::other)
+        };
+        self.disk
+            .switch(|layer| {
+                layer.seal()?;
+                // Once it is sealed, the guest has nothing to write to until the new one is
+                // open: that is tried again before the guest is left without a disk.
+                reopen().or_else(|_| {
+                    std::thread::sleep(Duration::from_secs(1));
+                    reopen()
+                })
+            })
+            .at("seal", &self.path)?;
+        // The new layer is built on the one that was sealed.
+        self.disk
+            .current()
+            .header()
+            .parent
+            .ok_or_else(|| Error::new(ErrorCode::Io, "The new layer isn't built on the sealed one."))
+    }
+
+    /// Stops serving the disk and closes it, once a seal that is under way is done.
+    fn close(&self) {
+        let Some(mut server) = self.server.lock().unwrap().take() else {
+            return;
+        };
+        server.stop();
+        // What can't be committed now is in the layer's journal, and comes back the next time.
+        if let Err(error) = self.disk.current().close() {
+            log(&format!("Couldn't close the disk: {error}."));
+        }
     }
 }
 
 impl Drop for ServedDisk {
     fn drop(&mut self) {
-        self.server.stop();
-        // What can't be committed now is in the layer's journal, and comes back the next time.
-        if let Err(error) = self.layer.close() {
-            _ = std::io::stderr().write_all(format!("Couldn't close the disk: {error}.\n").as_bytes());
+        self.close();
+    }
+}
+
+/// Writes a line to the machine's log, in one piece: several processes may be writing to it.
+fn log(line: &str) {
+    _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+}
+
+/// Waits for the setup of the first machine of an image and its scripts to finish, and then makes
+/// its disk the automatic image that the next one starts from. The guest keeps running: its file
+/// system is frozen while its layer is sealed.
+fn take_automatic(directory: &Path, served: &ServedDisk, shared: &Shared, automatic: &Automatic) {
+    let running = || shared.state() == State::Running;
+    loop {
+        for _ in 0..20 {
+            if !running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let Ok(info) = guest::info(directory) else {
+            continue;
+        };
+        match info.setup.map(|setup| setup.state) {
+            Some(SetupState::Finished) if info.booted => break,
+            // A setup that is finished by hand later, on a machine that has been in use, doesn't
+            // make an image for others.
+            Some(SetupState::Failed) => {
+                log("The setup failed. The disk doesn't become an automatic image.");
+                return give_up(directory);
+            }
+            // A guest without a setup has nothing to make an image of.
+            None if info.booted => return give_up(directory),
+            _ => {}
         }
     }
+    match make_automatic(directory, served, automatic) {
+        Ok(name) => log(&format!(
+            "The setup has finished. The disk is now the automatic image {name}."
+        )),
+        Err(error) => log(&format!("Couldn't make the automatic image: {error}")),
+    }
+}
+
+/// The machine's disk is no longer to become an automatic image.
+fn give_up(directory: &Path) {
+    if let Err(error) = Config::update(directory, |config| {
+        config.automatic = None;
+        Ok(())
+    }) {
+        log(&format!("Couldn't write the machine's settings: {error}"));
+    }
+}
+
+fn make_automatic(directory: &Path, served: &ServedDisk, automatic: &Automatic) -> Result<String> {
+    // Held throughout: the disk isn't closed under the seal, nor before the image is noted.
+    let open = served.server.lock().unwrap();
+    if open.is_none() {
+        return Err(Error::new(ErrorCode::NotRunning, "The machine has stopped."));
+    }
+    let (frozen, _) = guest::start(directory, &Job::Freeze { seconds: 30 })?;
+    let sealed = served.seal();
+    // Hanging up thaws the guest's file system.
+    drop(frozen);
+    let hash = sealed?;
+    let config = Config::load(directory)?;
+    let name = saved::automatic_name(&automatic.key);
+    {
+        let _changing = served.store.lock()?;
+        // Another first machine of the same kind may have got there first: that one stays.
+        if saved::find(&served.store, &name)?.is_none() {
+            saved::write(
+                &served.store,
+                &SavedImage {
+                    name: name.clone(),
+                    kind: ImageKind::Automatic,
+                    layer: disk::layer::to_hex(&hash),
+                    arch: config.arch.clone(),
+                    user: config.user.clone(),
+                    disk_size: config.disk.size,
+                    from: config.image.clone(),
+                    scripts: automatic.scripts.clone(),
+                    key: Some(automatic.key.clone()),
+                    created: now(),
+                },
+            )?;
+        }
+    }
+    Config::update(directory, |config| {
+        config.automatic = None;
+        Ok(())
+    })?;
+    drop(open);
+    Ok(name)
 }
 
 static TERMINATED: AtomicBool = AtomicBool::new(false);
@@ -260,8 +407,7 @@ pub fn run(directory: &Path) -> ExitCode {
     match serve(directory, &mut told) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // In one piece: several processes may be writing to the machine's log.
-            _ = std::io::stderr().write_all(format!("{error}\n").as_bytes());
+            log(&error.to_string());
             if !told {
                 tell(&Response::failed(error));
             }
@@ -292,10 +438,10 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     // Closed when this returns, after the machine has stopped and before its lock is let go of.
     let served = match config.disk.format {
         DiskFormat::Raw => None,
-        DiskFormat::Layer => Some(ServedDisk::start(directory, &config)?),
+        DiskFormat::Layer => Some(Arc::new(ServedDisk::start(directory, &config)?)),
     };
     let disk = match &served {
-        Some(served) => DiskAttachment::Network(served.server.url()),
+        Some(served) => DiskAttachment::Network(served.url.clone()),
         None => DiskAttachment::File(directory.join(&config.disk.file)),
     };
     let spec = Spec {
@@ -357,6 +503,18 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
         });
     }
 
+    // Waits for the setup to finish, and is left to itself: it finds the machine stopped and the
+    // disk closed.
+    if let (Some(automatic), Some(served)) = (&config.automatic, &served) {
+        let (directory, served, shared, automatic) = (
+            directory.to_owned(),
+            served.clone(),
+            service.shared.clone(),
+            automatic.clone(),
+        );
+        std::thread::spawn(move || take_automatic(&directory, &served, &shared, &automatic));
+    }
+
     // Told to end, the process shuts its guest down first, as it does when asked to stop.
     // Safety: the handler only stores to an atomic.
     unsafe {
@@ -379,6 +537,10 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while service.answering.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
+    }
+    // A seal that is under way is waited for.
+    if let Some(served) = &served {
+        served.close();
     }
     drop(served);
     forget();

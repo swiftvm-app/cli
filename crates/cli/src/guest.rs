@@ -410,7 +410,11 @@ fn ssh(host: &Host, name: &str, extra: &[String]) -> Result<Done> {
             store.join("ssh/known_hosts").display()
         ))
         .args(["-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"])
-        .arg(format!("{}@{name}", machine.user))
+        // The account apart from the destination, and nothing after `--` taken for an option.
+        .arg("-l")
+        .arg(&machine.user)
+        .arg("--")
+        .arg(name)
         .args(extra)
         .exec();
     Err(Error::new(ErrorCode::Io, format!("Couldn't start ssh: {error}.")))

@@ -18,6 +18,7 @@ const BUILT_IN: &[(&str, &str)] = &[
 /// The longest a script's name is kept at.
 const LONGEST_NAME: usize = 120;
 
+#[derive(Clone)]
 pub(crate) struct Script {
     /// What it sets up, as it calls itself.
     pub name: String,

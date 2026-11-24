@@ -28,6 +28,7 @@ pub(crate) struct Seed<'a> {
 /// is mounted at.
 const INSTALL: &str = include_str!("../guest/install.sh");
 const AGENT_UNIT: &str = include_str!("../guest/agent.service");
+const IDENTITY_UNIT: &str = include_str!("../guest/identity.service");
 const SETUP_RUNNER: &str = include_str!("../guest/setup-run.sh");
 const SETUP_UNIT: &str = include_str!("../guest/setup.service");
 
@@ -127,6 +128,8 @@ impl Seed<'_> {
             None => lines.push("ssh_pwauth: false".into()),
         }
         lines.extend([
+            // A machine made from an image gets keys of its own, as a new instance.
+            "ssh_deletekeys: true".into(),
             "growpart:".into(),
             "  mode: auto".into(),
             "  devices: [\"/\"]".into(),
@@ -173,6 +176,7 @@ impl Seed<'_> {
             ("network-config".into(), self.network_config().into_bytes()),
             ("agent".into(), self.agent.to_vec()),
             ("agent.service".into(), guest_text(AGENT_UNIT).into_bytes()),
+            ("identity.service".into(), guest_text(IDENTITY_UNIT).into_bytes()),
             ("install.sh".into(), guest_text(INSTALL).into_bytes()),
         ];
         if !self.scripts.is_empty() {

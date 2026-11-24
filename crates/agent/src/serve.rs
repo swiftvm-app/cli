@@ -11,7 +11,7 @@ use std::time::Duration;
 use proto::agent::{AGENT_PROTOCOL, AgentHello, Answer, Ended, Job, Kind, read_frame, write_frame};
 use proto::{Error, ErrorCode};
 
-use crate::{job, system};
+use crate::{freeze, job, system};
 
 /// How long the host gets to say hello and what it wants.
 const ASKING: Duration = Duration::from_secs(30);
@@ -92,6 +92,7 @@ impl Agent {
             Job::CopyOut { path, user } => job::run_self(stream, &self.program, &["pack", &path], user),
             Job::Tunnel { port } => tunnel(stream, port),
             Job::Update { size } => self.update(stream, size),
+            Job::Freeze { seconds } => freeze::run(stream, seconds),
         }
     }
 

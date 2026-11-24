@@ -36,6 +36,8 @@ pub enum ErrorCode {
     Guest,
     /// Something took longer than it was given.
     TimedOut,
+    /// An image that machines are built on, which can't go before they do.
+    InUse,
     /// A code from a newer version.
     #[serde(other)]
     Unknown,

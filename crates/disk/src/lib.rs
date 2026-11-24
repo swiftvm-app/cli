@@ -8,9 +8,11 @@ pub mod layer;
 pub mod nbd;
 mod raw;
 pub mod storage;
+mod switch;
 
 pub use layer::{Header, Layer, Options, Stats};
 pub use raw::RawDisk;
+pub use switch::Switchable;
 
 use std::io;
 
