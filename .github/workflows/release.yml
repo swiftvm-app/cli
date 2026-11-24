@@ -1,19 +1,26 @@
-# Releases the version that Cargo.toml has when its tag, v<version>, is pushed:
+# Releases the program, from the Actions tab (Release, then Run workflow) or with
 #
-#   git tag v0.2.0 && git push origin v0.2.0
+#   gh workflow run release.yml -f version=patch
 #
-# It builds the program for macOS and Linux on arm64 and x86-64, signs and notarizes the Mac ones,
-# and publishes them as a GitHub release with install.sh (scripts/get.sh) and SHA256SUMS. A stable
-# version then goes into the Homebrew tap, <owner>/homebrew-tap. A version with a hyphen, such as
-# 0.2.0-beta.1, is a pre-release: the latest release and the tap stay as they are.
+# The version is one such as 1.2.0 or 1.2.0-beta.1, or patch, minor or major to step the one in
+# Cargo.toml (scripts/set-version.sh). The workflow commits the new version to main, tags it
+# v<version>, builds the program for macOS and Linux on arm64 and x86-64, signs and notarizes the
+# Mac ones, and publishes them as a GitHub release with install.sh (scripts/get.sh) and
+# SHA256SUMS. A stable version then goes into the Homebrew tap, <owner>/homebrew-tap. A version
+# with a hyphen is a pre-release: the latest release and the tap stay as they are.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, such as 1.2.0 or 1.2.0-beta.1, or patch, minor or major"
+        required: true
+        default: patch
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 permissions:
@@ -24,20 +31,31 @@ env:
 
 jobs:
   prepare:
-    name: The version and the name
+    name: Version and tag
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     outputs:
-      name: ${{ steps.read.outputs.name }}
-      version: ${{ steps.read.outputs.version }}
-      prerelease: ${{ steps.read.outputs.prerelease }}
+      name: ${{ steps.version.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
+      - name: Only from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are made from main, not $GITHUB_REF_NAME."
+          exit 1
       - uses: actions/checkout@v4
-      - id: read
+      - id: version
+        env:
+          WANTED: ${{ inputs.version }}
         run: |
           name=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.metadata]" && /^name *=/ { print $2; exit }' Cargo.toml)
-          version=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.package]" && /^version *=/ { print $2; exit }' Cargo.toml)
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::The tag is $GITHUB_REF_NAME, but Cargo.toml's version is $version. Its tag is v$version."
+          version=$(scripts/set-version.sh "$WANTED")
+          tag=v$version
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "::error::$tag is already released. Give a newer version."
             exit 1
           fi
           case $version in
@@ -47,8 +65,23 @@ jobs:
           {
             echo "name=$name"
             echo "version=$version"
+            echo "tag=$tag"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+      # The version that Cargo.toml already has, such as the first release's, is only tagged.
+      - name: Commit the version and tag it
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git commit -am "Release $VERSION"
+            git push origin HEAD:main
+          fi
+          git tag -a "$TAG" -m "$VERSION"
+          git push origin "$TAG"
 
   macos:
     name: macOS, signed and notarized
@@ -59,6 +92,8 @@ jobs:
       NAME: ${{ needs.prepare.outputs.name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - name: Rust, with the targets of the program and of the guest's agent
         run: |
           rustup update stable
@@ -159,6 +194,8 @@ jobs:
       NAME: ${{ needs.prepare.outputs.name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - name: Tools
         run: |
           sudo apt-get update -q
@@ -190,9 +227,12 @@ jobs:
       NAME: ${{ needs.prepare.outputs.name }}
       VERSION: ${{ needs.prepare.outputs.version }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      TAG: ${{ needs.prepare.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           pattern: program-*
@@ -216,7 +256,7 @@ jobs:
         run: |
           set -- --prerelease=false
           [ "$PRERELEASE" = false ] || set -- --prerelease
-          gh release create "$GITHUB_REF_NAME" out/* "$@" \
+          gh release create "$TAG" out/* "$@" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$NAME $VERSION" \
@@ -225,11 +265,13 @@ jobs:
   homebrew:
     name: The Homebrew tap
     needs: [prepare, release]
-    if: needs.prepare.outputs.prerelease == 'false'
+    # The formula downloads from the release, which only a public repository lets everyone do.
+    if: needs.prepare.outputs.prerelease == 'false' && !github.event.repository.private
     runs-on: ubuntu-24.04
     env:
       NAME: ${{ needs.prepare.outputs.name }}
       VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
       TAP: ${{ github.repository_owner }}/homebrew-tap
     steps:
       - name: Write the formula and push it
@@ -241,7 +283,7 @@ jobs:
             echo "::error::The HOMEBREW_GH_TOKEN secret isn't set."
             exit 1
           fi
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
           sum() {
             found=$(awk -v asset="$NAME-$1.tar.gz" '$2 == asset { print $1 }' "$RUNNER_TEMP/SHA256SUMS")
             [ -n "$found" ] || { echo "::error::SHA256SUMS has no $NAME-$1.tar.gz." >&2; exit 1; }

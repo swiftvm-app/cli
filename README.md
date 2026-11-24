@@ -46,10 +46,10 @@ Apps use `--json`, described in [docs/api.md](docs/api.md).
 
 ## Release
 
-Set `version` under `[workspace.package]` in `Cargo.toml`, commit, and push its tag:
+Run the Release workflow from the Actions tab, or:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+gh workflow run release.yml -f version=patch    # or minor, major, or a version such as 1.2.0 or 1.2.0-beta.1
 ```
 
-[.github/workflows/release.yml](.github/workflows/release.yml) builds for macOS and Linux on arm64 and x86-64, signs and notarizes the Mac programs, publishes the release with `install.sh` and `SHA256SUMS`, and updates `Formula/svm.rb` in [swiftvm-app/homebrew-tap](https://github.com/swiftvm-app/homebrew-tap). A version with a hyphen, such as `0.2.0-beta.1`, is a pre-release, which leaves the latest release and the tap alone.
+[.github/workflows/release.yml](.github/workflows/release.yml) sets the version in `Cargo.toml` ([scripts/set-version.sh](scripts/set-version.sh)), commits it to `main` and tags it. It then builds for macOS and Linux on arm64 and x86-64, signs and notarizes the Mac programs, publishes the release with `install.sh` and `SHA256SUMS`, and updates `Formula/svm.rb` in [swiftvm-app/homebrew-tap](https://github.com/swiftvm-app/homebrew-tap). A version with a hyphen is a pre-release, which leaves the latest release and the tap alone. A version that `Cargo.toml` already has is only tagged, as for the first release, 0.1.0.
