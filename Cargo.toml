@@ -2,6 +2,11 @@
 resolver = "3"
 members = ["crates/*"]
 
+# The product's name. Nothing else spells it out, so changing it renames the product: the command,
+# its folders and its environment variables.
+[workspace.metadata]
+name = "swiftvm"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

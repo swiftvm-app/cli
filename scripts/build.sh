@@ -1,9 +1,11 @@
 #!/bin/sh
-# Builds the release program as dist/<name>, where <name> is what the NAME file says.
+# Builds the release program as dist/<name>, where <name> is `name` under [workspace.metadata] in
+# Cargo.toml.
 # On a Mac it is signed with the virtualization entitlement, without which it can't run machines.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
-name=$(tr -d '[:space:]' < "$root/NAME")
+name=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.metadata]" && /^name *=/ { print $2; exit }' "$root/Cargo.toml")
+[ -n "$name" ] || { echo "Cargo.toml has no name under [workspace.metadata]" >&2; exit 1; }
 cd "$root"
 cargo build --release -p cli
 mkdir -p dist

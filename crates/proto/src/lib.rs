@@ -10,9 +10,9 @@ pub use control::{
 };
 pub use error::{Error, ErrorCode, Result};
 
-/// The product's name: the one line in the `NAME` file at the repository's root. Nothing else
-/// spells it out, so changing that file renames the product.
-pub const NAME: &str = include_str!("../../../NAME").trim_ascii();
+/// The product's name: `name` under `[workspace.metadata]` in the workspace's `Cargo.toml`, which
+/// the build script passes on.
+pub const NAME: &str = env!("PRODUCT_NAME");
 
 /// The name of one of the product's environment variables: `HOME` gives `<NAME>_HOME`.
 pub fn variable(suffix: &str) -> String {
