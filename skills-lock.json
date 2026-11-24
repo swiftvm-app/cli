@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "skills": {
+    "code-review": {
+      "source": "saeedvaziry/skills",
+      "ref": "main",
+      "commit": "f5efb107dcf94da473e2eef028a595b36ddd96d6",
+      "sourceType": "github",
+      "skillPath": "skills/code-review/SKILL.md",
+      "computedHash": "8a26d301e702e45f146accdf08e2e52aa21a626fce7e6bf3c1440c34147f297d"
+    },
+    "implement": {
+      "source": "saeedvaziry/skills",
+      "ref": "main",
+      "commit": "f5efb107dcf94da473e2eef028a595b36ddd96d6",
+      "sourceType": "github",
+      "skillPath": "skills/implement/SKILL.md",
+      "computedHash": "cf990a970ee100d3d05e3e9b72d478458cef9fc0f37e9a2cb153e9eca27d14b5"
+    }
+  }
+}
