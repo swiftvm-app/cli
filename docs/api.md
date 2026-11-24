@@ -1,11 +1,11 @@
 # The JSON API
 
-Apps drive `swiftvm` by running it with `--json` and reading what it prints. This page is version 1 of that API. `swiftvm version --json` says which version a program speaks.
+Apps drive `svm` by running it with `--json` and reading what it prints. This page is version 1 of that API. `svm version --json` says which version a program speaks.
 
 ## Running a command
 
 ```sh
-swiftvm <command> [arguments] --json
+svm <command> [arguments] --json
 ```
 
 | Channel | What it carries |
@@ -122,7 +122,7 @@ What the agent in a running guest reports:
 
 | Command | Result |
 |---|---|
-| `version` | `{"name": "swiftvm", "version": "0.1.0", "api": 1}` |
+| `version` | `{"name": "svm", "version": "0.1.0", "api": 1}` |
 | `images [--all]` | `{"images": [Image]}` |
 | `create <image> ...` | `{"machine": Machine}`. Reports progress |
 | `list` | `{"machines": [Machine]}`, sorted by name |
@@ -171,8 +171,8 @@ Replace your list with each line. Changes to `disk_used` and `disk_shared` alone
 
 | Variable | Default on macOS | Default on Linux | Holds |
 |---|---|---|---|
-| `SWIFTVM_HOME` | `~/Library/Application Support/swiftvm` | `$XDG_DATA_HOME/swiftvm` or `~/.local/share/swiftvm` | Machines, images and layers |
-| `SWIFTVM_CACHE` | `~/Library/Caches/swiftvm` | `$XDG_CACHE_HOME/swiftvm` or `~/.cache/swiftvm` | Downloaded images, and the engine on Linux |
+| `SVM_HOME` | `~/Library/Application Support/svm` | `$XDG_DATA_HOME/svm` or `~/.local/share/svm` | Machines, images and layers |
+| `SVM_CACHE` | `~/Library/Caches/svm` | `$XDG_CACHE_HOME/svm` or `~/.cache/svm` | Downloaded images, and the engine on Linux |
 
 Every program that uses the same folders sees the same machines. Several may run at once.
 

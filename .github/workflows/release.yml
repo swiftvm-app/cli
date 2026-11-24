@@ -1,0 +1,348 @@
+# Releases the version that Cargo.toml has when its tag, v<version>, is pushed:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# It builds the program for macOS and Linux on arm64 and x86-64, signs and notarizes the Mac ones,
+# and publishes them as a GitHub release with install.sh (scripts/get.sh) and SHA256SUMS. A stable
+# version then goes into the Homebrew tap, <owner>/homebrew-tap. A version with a hyphen, such as
+# 0.2.0-beta.1, is a pre-release: the latest release and the tap stay as they are.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: The version and the name
+    runs-on: ubuntu-24.04
+    outputs:
+      name: ${{ steps.read.outputs.name }}
+      version: ${{ steps.read.outputs.version }}
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          name=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.metadata]" && /^name *=/ { print $2; exit }' Cargo.toml)
+          version=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.package]" && /^version *=/ { print $2; exit }' Cargo.toml)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME, but Cargo.toml's version is $version. Its tag is v$version."
+            exit 1
+          fi
+          case $version in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: macOS, signed and notarized
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      NAME: ${{ needs.prepare.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, with the targets of the program and of the guest's agent
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+
+      - name: The Developer ID certificate, in a keychain of the job's own
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE" ] || [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "::error::The DEVELOPER_ID_APPLICATION_CERTIFICATE and KEYCHAIN_PASSWORD secrets aren't set."
+            exit 1
+          fi
+          keychain=$RUNNER_TEMP/signing.keychain-db
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$identity" ]; then
+            echo "::error::The certificate has no Developer ID Application identity."
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Build and sign
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            scripts/build.sh "$target"
+            codesign --verify --strict --verbose=2 "dist/$target/$NAME"
+            codesign --display --verbose=2 "dist/$target/$NAME" 2>&1 | grep -q 'flags=.*runtime'
+          done
+          "dist/aarch64-apple-darwin/$NAME" version
+
+      # notarytool takes a zip. A bare program can't have the ticket stapled to it: Gatekeeper
+      # finds it online.
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mkdir -p notarize/arm64 notarize/x86_64
+          cp "dist/aarch64-apple-darwin/$NAME" notarize/arm64/
+          cp "dist/x86_64-apple-darwin/$NAME" notarize/x86_64/
+          ditto -c -k --keepParent notarize "$RUNNER_TEMP/notarize.zip"
+          notary() {
+            xcrun notarytool "$@" --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          }
+          notary submit "$RUNNER_TEMP/notarize.zip" --wait --output-format json > "$RUNNER_TEMP/notarized.json" || true
+          cat "$RUNNER_TEMP/notarized.json"
+          id=$(jq -r '.id // empty' "$RUNNER_TEMP/notarized.json")
+          [ -z "$id" ] || notary log "$id" || true
+          status=$(jq -r '.status // empty' "$RUNNER_TEMP/notarized.json")
+          if [ "$status" != Accepted ]; then
+            echo "::error::Notarization ended with \"$status\"."
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p out
+          # Without the Mac's extended attributes, as ._ files or headers, which other tars warn of.
+          export COPYFILE_DISABLE=1
+          tar --no-xattrs --no-mac-metadata -czf "out/$NAME-macos-arm64.tar.gz" -C dist/aarch64-apple-darwin "$NAME"
+          tar --no-xattrs --no-mac-metadata -czf "out/$NAME-macos-x86_64.tar.gz" -C dist/x86_64-apple-darwin "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: program-macos
+          path: out/*
+          if-no-files-found: error
+
+      - name: Delete the keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      NAME: ${{ needs.prepare.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+      - name: Build, with passt
+        run: |
+          scripts/build.sh ${{ matrix.target }}
+          test -x "dist/${{ matrix.target }}/passt"
+          "dist/${{ matrix.target }}/$NAME" version
+      - name: Package
+        run: |
+          mkdir -p out
+          tar -czf "out/$NAME-linux-${{ matrix.arch }}.tar.gz" -C "dist/${{ matrix.target }}" "$NAME" passt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: program-linux-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: The GitHub release
+    needs: [prepare, macos, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      NAME: ${{ needs.prepare.outputs.name }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: program-*
+          merge-multiple: true
+          path: out
+      - name: install.sh and SHA256SUMS
+        run: |
+          variable=$(echo "$NAME" | tr a-z- A-Z_)
+          sed -e "s|@NAME@|$NAME|g" -e "s|@VARIABLE@|$variable|g" -e "s|@REPO@|$GITHUB_REPOSITORY|g" scripts/get.sh > out/install.sh
+          if grep -n '@[A-Z]*@' out/install.sh; then
+            echo "::error::install.sh has a name that wasn't filled in."
+            exit 1
+          fi
+          sh -n out/install.sh
+          cd out
+          sha256sum -- *.tar.gz install.sh > SHA256SUMS
+          cat SHA256SUMS
+      # With files, gh makes a draft, uploads them, and then publishes it, so that the release is
+      # never seen without them.
+      - name: Publish
+        run: |
+          set -- --prerelease=false
+          [ "$PRERELEASE" = false ] || set -- --prerelease
+          gh release create "$GITHUB_REF_NAME" out/* "$@" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$NAME $VERSION" \
+            --generate-notes
+
+  homebrew:
+    name: The Homebrew tap
+    needs: [prepare, release]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    env:
+      NAME: ${{ needs.prepare.outputs.name }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAP: ${{ github.repository_owner }}/homebrew-tap
+    steps:
+      - name: Write the formula and push it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_GH_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::The HOMEBREW_GH_TOKEN secret isn't set."
+            exit 1
+          fi
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          sum() {
+            found=$(awk -v asset="$NAME-$1.tar.gz" '$2 == asset { print $1 }' "$RUNNER_TEMP/SHA256SUMS")
+            [ -n "$found" ] || { echo "::error::SHA256SUMS has no $NAME-$1.tar.gz." >&2; exit 1; }
+            echo "$found"
+          }
+          macos_arm64=$(sum macos-arm64)
+          macos_x86_64=$(sum macos-x86_64)
+          linux_arm64=$(sum linux-arm64)
+          linux_x86_64=$(sum linux-x86_64)
+          # Ruby's name for the formula's class: svm gives Svm, and some-name gives SomeName.
+          class=$(echo "$NAME" | sed -E 's/(^|[-_])([a-z])/\U\2/g')
+          download=https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION
+
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/$TAP.git" tap
+          mkdir -p tap/Formula
+          # passt goes next to the program on Linux, where the program looks for it. Both are in
+          # libexec, so that passt doesn't land on PATH.
+          cat > "tap/Formula/$NAME.rb" <<EOF
+          class $class < Formula
+            desc "Linux virtual machines for AI agents"
+            homepage "https://github.com/$GITHUB_REPOSITORY"
+            version "$VERSION"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "$download/$NAME-macos-arm64.tar.gz"
+                sha256 "$macos_arm64"
+              end
+              on_intel do
+                url "$download/$NAME-macos-x86_64.tar.gz"
+                sha256 "$macos_x86_64"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$download/$NAME-linux-arm64.tar.gz"
+                sha256 "$linux_arm64"
+              end
+              on_intel do
+                url "$download/$NAME-linux-x86_64.tar.gz"
+                sha256 "$linux_x86_64"
+              end
+            end
+
+            def install
+              libexec.install Dir["*"]
+              bin.install_symlink libexec/"$NAME"
+            end
+
+            def caveats
+              on_linux do
+                <<~TEXT
+                  Machines need /dev/kvm: add your user to the kvm group, and log in again.
+                TEXT
+              end
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/$NAME version")
+            end
+          end
+          EOF
+          cat "tap/Formula/$NAME.rb"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Formula/$NAME.rb"
+          if git diff --cached --quiet; then
+            echo "The tap already has $NAME $VERSION."
+            exit 0
+          fi
+          git commit -m "Update $NAME to $VERSION"
+          git push
+
+  # Installs the release the ways people do. Downloads need the repository to be public.
+  try:
+    name: Install with ${{ matrix.with }} (${{ matrix.os }})
+    needs: [prepare, release, homebrew]
+    if: ${{ !cancelled() && needs.release.result == 'success' && !github.event.repository.private }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
+        with: [curl, homebrew]
+    runs-on: ${{ matrix.os }}
+    env:
+      NAME: ${{ needs.prepare.outputs.name }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - if: matrix.with == 'curl'
+        run: |
+          variable=$(echo "$NAME" | tr a-z- A-Z_)
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/install.sh" | env "${variable}_VERSION=$VERSION" sh
+          test "$("$HOME/.local/bin/$NAME" version --json | jq -r .version)" = "$VERSION"
+          if [ "$(uname)" = Linux ]; then test -x "$HOME/.local/bin/passt"; fi
+      # The tap has stable versions alone.
+      - if: matrix.with == 'homebrew' && needs.homebrew.result == 'success'
+        run: |
+          [ "$(uname)" = Darwin ] || eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install "$GITHUB_REPOSITORY_OWNER/tap/$NAME"
+          brew test "$GITHUB_REPOSITORY_OWNER/tap/$NAME"
+          test "$("$NAME" version --json | jq -r .version)" = "$VERSION"

@@ -1,6 +1,22 @@
-# swiftvm
+# svm
 
 Creates and runs Linux virtual machines for AI agents, on macOS and Linux, on arm64 and x86-64. No daemon: each running machine is a process of its own.
+
+It lives alongside the SwiftVM app and its `swiftvm` command: its own command, folders (`~/Library/Application Support/svm`, `~/Library/Caches/svm`, or `~/.local/share/svm` and `~/.cache/svm` on Linux) and variables (`SVM_HOME`, `SVM_CACHE`).
+
+## Install
+
+```sh
+curl -fsSL https://github.com/swiftvm-app/cli/releases/latest/download/install.sh | sh
+```
+
+It installs into `~/.local/bin`; `SVM_INSTALL_DIR` picks another folder and `SVM_VERSION` another release. Or with Homebrew:
+
+```sh
+brew install swiftvm-app/tap/svm
+```
+
+macOS 14 or later, or Linux with KVM (the user in the `kvm` group). The Mac programs are signed with a Developer ID and notarized.
 
 ## Install from source
 
@@ -19,11 +35,21 @@ Installing again while machines run is safe: they keep the program they started 
 ## Use
 
 ```sh
-swiftvm create debian-13 --name dev
-swiftvm start dev
-swiftvm wait dev
-swiftvm ssh dev
-swiftvm help
+svm create debian-13 --name dev
+svm start dev
+svm wait dev
+svm ssh dev
+svm help
 ```
 
 Apps use `--json`, described in [docs/api.md](docs/api.md).
+
+## Release
+
+Set `version` under `[workspace.package]` in `Cargo.toml`, commit, and push its tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+[.github/workflows/release.yml](.github/workflows/release.yml) builds for macOS and Linux on arm64 and x86-64, signs and notarizes the Mac programs, publishes the release with `install.sh` and `SHA256SUMS`, and updates `Formula/svm.rb` in [swiftvm-app/homebrew-tap](https://github.com/swiftvm-app/homebrew-tap). A version with a hyphen, such as `0.2.0-beta.1`, is a pre-release, which leaves the latest release and the tap alone.

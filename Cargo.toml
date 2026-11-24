@@ -5,7 +5,7 @@ members = ["crates/*"]
 # The product's name. Nothing else spells it out, so changing it renames the product: the command,
 # its folders and its environment variables.
 [workspace.metadata]
-name = "swiftvm"
+name = "svm"
 
 [workspace.package]
 version = "0.1.0"

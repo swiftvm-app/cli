@@ -1,27 +1,42 @@
 #!/bin/sh
 # Builds the release program as dist/<name>, where <name> is `name` under [workspace.metadata] in
 # Cargo.toml.
-# On a Mac it is signed with the virtualization entitlement, without which it can't run machines.
 #
-# With a target, such as aarch64-unknown-linux-musl, it builds for that instead, into
-# dist/<target>/<name>. For Linux that is a static program, and passt goes next to it when this
-# runs on Linux (scripts/build-passt.sh). From a Mac, zig is the C compiler: zstd is C.
+# With a target, such as aarch64-unknown-linux-musl or x86_64-apple-darwin, it builds for that
+# instead, into dist/<target>/<name>. For Linux that is a static program, and passt goes next to it
+# when this runs on Linux on the same processor (scripts/build-passt.sh). From a Mac, zig is the C
+# compiler for Linux: zstd is C.
+#
+# A program for macOS is signed with the virtualization entitlement, without which it can't run
+# machines, and with the hardened runtime, which notarization requires. SIGN_IDENTITY names the
+# certificate, such as "Developer ID Application: …"; without it the signature is ad hoc.
 # Usage: scripts/build.sh [<target>]
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 name=$(awk -F'"' '/^\[/ { section = $0 } section == "[workspace.metadata]" && /^name *=/ { print $2; exit }' "$root/Cargo.toml")
 [ -n "$name" ] || { echo "Cargo.toml has no name under [workspace.metadata]" >&2; exit 1; }
+[ $# -le 1 ] || { echo "usage: $0 [<target>]" >&2; exit 2; }
 cd "$root"
 
-if [ $# -gt 0 ]; then
+sign() {
+    identity=${SIGN_IDENTITY:--}
+    set -- --sign "$identity" --force --identifier "$name" --options runtime \
+        --entitlements config/virtualization.entitlements "$1"
+    # An ad hoc signature can't carry Apple's timestamp.
+    [ "$identity" = - ] || set -- --timestamp "$@"
+    codesign "$@"
+}
+
+if [ $# = 1 ]; then
     target=$1
-    variable=$(echo "$target" | tr a-z- A-Z_)
+    built=target/$target/release/cli
+    out=dist/$target
     if [ "$(uname)" = Darwin ]; then
         case $target in
             *-linux-*)
                 command -v zig >/dev/null || { echo "build: zig isn't installed" >&2; exit 1; }
-                zig_target=$(echo "$target" | sed 's/-unknown-linux-/-linux-/')
-                export ZIG_TARGET="$zig_target"
+                variable=$(echo "$target" | tr a-z- A-Z_)
+                export ZIG_TARGET="$(echo "$target" | sed 's/-unknown-linux-/-linux-/')"
                 export "CC_$(echo "$target" | tr - _)=$root/scripts/zig-cc"
                 export "AR_$(echo "$target" | tr - _)=$root/scripts/zig-ar"
                 export "CARGO_TARGET_${variable}_LINKER=rust-lld"
@@ -29,29 +44,29 @@ if [ $# -gt 0 ]; then
         esac
     fi
     cargo build --release -p cli --target "$target"
-    mkdir -p "dist/$target"
-    cp "target/$target/release/cli" "dist/$target/.$name.new"
-    mv -f "dist/$target/.$name.new" "dist/$target/$name"
-    case $target in
-        *-linux-*)
-            if [ "$(uname)" = Linux ] && [ "$(uname -m)" = "${target%%-*}" ]; then
-                scripts/build-passt.sh "dist/$target" >/dev/null
-            else
-                echo "build: passt isn't built here: that takes Linux on the same processor. Machines use the system's passt." >&2
-            fi
-            ;;
-    esac
-    echo "dist/$target/$name"
-    exit 0
+else
+    target=
+    built=target/release/cli
+    out=dist
+    cargo build --release -p cli
 fi
 
-cargo build --release -p cli
-mkdir -p dist
+mkdir -p "$out"
 # Put in place under a new name and then renamed: a machine that is running is a process of the
 # program that was there before, and macOS ends a process whose program's file is written over.
-cp target/release/cli "dist/.$name.new"
-if [ "$(uname)" = Darwin ]; then
-    codesign --sign - --force --identifier "$name" --entitlements config/virtualization.entitlements "dist/.$name.new"
-fi
-mv -f "dist/.$name.new" "dist/$name"
-echo "dist/$name"
+cp "$built" "$out/.$name.new"
+case ${target:-$(uname)} in
+    *-apple-darwin | Darwin) sign "$out/.$name.new" ;;
+esac
+mv -f "$out/.$name.new" "$out/$name"
+
+case $target in
+    *-linux-*)
+        if [ "$(uname)" = Linux ] && [ "$(uname -m)" = "${target%%-*}" ]; then
+            scripts/build-passt.sh "$out" >/dev/null
+        else
+            echo "build: passt isn't built here: that takes Linux on the same processor. Machines use the system's passt." >&2
+        fi
+        ;;
+esac
+echo "$out/$name"
