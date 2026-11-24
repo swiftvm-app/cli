@@ -6,6 +6,7 @@ use std::path::Path;
 
 use proto::NAME;
 
+use crate::scripts::{Script, guest_text, line};
 use crate::{Error, ErrorCode, Result, iso};
 
 pub(crate) struct Seed<'a> {
@@ -17,7 +18,23 @@ pub(crate) struct Seed<'a> {
     pub password: Option<&'a str>,
     /// The network card to configure.
     pub mac_address: &'a str,
+    /// The guest's agent, which the first start installs.
+    pub agent: &'a [u8],
+    /// What the first start sets up once it is over, one after the other.
+    pub scripts: &'a [Script],
 }
+
+/// What installs the agent and the setup scripts: the files on the disc, with the folder the disc
+/// is mounted at.
+const INSTALL: &str = include_str!("../guest/install.sh");
+const AGENT_UNIT: &str = include_str!("../guest/agent.service");
+const SETUP_RUNNER: &str = include_str!("../guest/setup-run.sh");
+const SETUP_UNIT: &str = include_str!("../guest/setup.service");
+
+/// Mounts the disc and runs its `install.sh`. In a shell of its own, which cloud-init's script of
+/// commands goes on after.
+const RUN_INSTALL: &str = "(seed=$(mktemp -d) && device=$(blkid -L cidata || blkid -L CIDATA) \
+&& mount -o ro \"$device\" \"$seed\" && { sh \"$seed/install.sh\" \"$seed\"; status=$?; umount \"$seed\"; rmdir \"$seed\"; exit $status; })";
 
 /// What is wrong with `user` as the name of the account to create.
 pub(crate) fn check_user(user: &str) -> Result<()> {
@@ -118,6 +135,7 @@ impl Seed<'_> {
             format!("    content: {}", yaml(CONSOLE_SETTINGS)),
             "runcmd:".into(),
             format!("  - {}", yaml(UPDATE_BOOT_MENU)),
+            format!("  - {}", yaml(RUN_INSTALL)),
         ]);
         lines.join("\n") + "\n"
     }
@@ -131,14 +149,51 @@ impl Seed<'_> {
         )
     }
 
+    /// What the setup runner is told about the scripts and the machine, one `key=value` to a
+    /// line. It reads the lines and never runs them, so a value can be anything on one line.
+    fn settings(&self) -> String {
+        let names: Vec<&str> = self.scripts.iter().map(|script| script.name.as_str()).collect();
+        format!(
+            "name={}\nrestart={}\nuser={}\n",
+            line(&names.join(", "), 200),
+            if self.scripts.iter().any(|script| script.restart) {
+                "yes"
+            } else {
+                "no"
+            },
+            self.user
+        )
+    }
+
+    /// The disc's files, by name.
+    fn files(&self) -> BTreeMap<String, Vec<u8>> {
+        let mut files = vec![
+            ("meta-data".into(), self.meta_data().into_bytes()),
+            ("user-data".into(), self.user_data().into_bytes()),
+            ("network-config".into(), self.network_config().into_bytes()),
+            ("agent".into(), self.agent.to_vec()),
+            ("agent.service".into(), guest_text(AGENT_UNIT).into_bytes()),
+            ("install.sh".into(), guest_text(INSTALL).into_bytes()),
+        ];
+        if !self.scripts.is_empty() {
+            files.push(("setup-run.sh".into(), guest_text(SETUP_RUNNER).into_bytes()));
+            files.push(("setup.service".into(), guest_text(SETUP_UNIT).into_bytes()));
+            files.push(("settings".into(), self.settings().into_bytes()));
+        }
+        for (index, script) in self.scripts.iter().enumerate() {
+            let number = index + 1;
+            files.push((format!("script-{number}"), script.source.clone()));
+            files.push((
+                format!("script-{number}.name"),
+                format!("{}\n", script.name).into_bytes(),
+            ));
+        }
+        files.into_iter().collect()
+    }
+
     /// Writes the disc at `path`.
     pub fn write(&self, path: &Path) -> Result<()> {
-        let files = BTreeMap::from([
-            ("meta-data", self.meta_data().into_bytes()),
-            ("user-data", self.user_data().into_bytes()),
-            ("network-config", self.network_config().into_bytes()),
-        ]);
-        iso::write(path, "cidata", &files)
+        iso::write(path, "cidata", &self.files())
     }
 }
 
@@ -177,6 +232,8 @@ mod tests {
             user: "username",
             password: Some("it's \"#: {odd}\\"),
             mac_address: "52:54:00:AA:BB:CC",
+            agent: b"agent",
+            scripts: &[],
         };
         let settings = seed.user_data();
         assert!(settings.starts_with("#cloud-config\n"));
@@ -186,6 +243,34 @@ mod tests {
             seed.network_config()
                 .contains("macaddress: \"52:54:00:aa:bb:cc\"")
         );
+    }
+
+    #[test]
+    fn the_setup_goes_on_the_disc_only_with_scripts() {
+        let mut seed = Seed {
+            host_name: "a",
+            instance_id: "1234",
+            user: "username",
+            password: None,
+            mac_address: "52:54:00:aa:bb:cc",
+            agent: b"agent",
+            scripts: &[],
+        };
+        let files = seed.files();
+        assert!(files.contains_key("install.sh") && files.contains_key("agent.service"));
+        assert!(!files.contains_key("setup-run.sh"));
+        let install = String::from_utf8(files["install.sh"].clone()).unwrap();
+        assert!(install.contains(&format!("/usr/local/lib/{NAME}")) && !install.contains('@'));
+
+        let scripts = [Script::find("docker").unwrap(), Script::find("updates").unwrap()];
+        seed.scripts = &scripts;
+        let files = seed.files();
+        assert_eq!(
+            String::from_utf8(files["settings"].clone()).unwrap(),
+            "name=Docker, Updates\nrestart=yes\nuser=username\n"
+        );
+        assert!(files.contains_key("script-2") && files.contains_key("setup.service"));
+        assert!(seed.user_data().contains("install.sh"));
     }
 
     /// The system's own reader of discs, where it has one, finds the files under their names.
@@ -201,9 +286,16 @@ mod tests {
             user: "username",
             password: None,
             mac_address: "52:54:00:aa:bb:cc",
+            agent: b"agent",
+            scripts: &[Script::find("docker").unwrap()],
         };
         seed.write(&path).unwrap();
-        for (name, contents) in [("user-data", seed.user_data()), ("meta-data", seed.meta_data())] {
+        for (name, contents) in [
+            ("user-data", seed.user_data()),
+            ("meta-data", seed.meta_data()),
+            ("agent", "agent".into()),
+            ("script-1.name", "Docker\n".into()),
+        ] {
             let read = std::process::Command::new("/usr/bin/tar")
                 .arg("-xOf")
                 .arg(&path)

@@ -2,7 +2,8 @@
 //!
 //! Each side first sends a [`Hello`]. The client then sends [`Request`]s and reads a [`Response`]
 //! to each. After the answer to [`Request::Console`] the connection carries the console's bytes
-//! both ways instead.
+//! both ways instead, and after the answer to [`Request::Connect`] those of a connection to a
+//! port in the guest.
 
 use std::io::{self, Read, Write};
 
@@ -42,6 +43,10 @@ pub enum Request {
         timeout: Option<u64>,
     },
     Console,
+    /// Connects to a port of the guest's socket device.
+    Connect {
+        port: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

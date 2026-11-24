@@ -8,6 +8,7 @@ mod client;
 mod console;
 mod download;
 mod engine;
+mod guest;
 mod host;
 mod images;
 mod import;
@@ -16,12 +17,16 @@ mod lock;
 mod paths;
 pub mod process;
 mod qcow2;
+mod scripts;
 mod seed;
 mod store;
 
-pub use host::{CreateOptions, Host, ImageSummary, Machine, MachineState, Progress};
+pub use host::{CreateOptions, ExecOptions, Host, ImageSummary, Machine, MachineState, Progress};
 pub use paths::{cache_directory, home_directory};
+pub use proto::agent::{Address, Ended, GuestInfo, Setup, SetupState};
+pub use proto::relay::relay;
 pub use proto::{Error, ErrorCode, NAME, Result};
+pub use scripts::built_in as setup_scripts;
 pub use store::{Config, DiskConfig, DiskFormat, Store};
 
 use std::fmt::Display;
@@ -62,3 +67,8 @@ pub(crate) fn random_hex(bytes: usize) -> Result<String> {
         .context("read random numbers from the system")?;
     Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
+
+/// The guest's agent, a static Linux program for this computer's processor.
+pub(crate) const AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent"));
+/// When it was built, in seconds since 1970.
+pub(crate) const AGENT_BUILT: &str = env!("AGENT_BUILT");

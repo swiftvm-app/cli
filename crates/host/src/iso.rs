@@ -158,7 +158,7 @@ fn path_table(root: u32, big_endian: bool) -> Vec<u8> {
 }
 
 /// Writes an image at `path` whose volume is called `volume` and holds `files`, by their names.
-pub(crate) fn write(path: &Path, volume: &str, files: &BTreeMap<&str, Vec<u8>>) -> Result<()> {
+pub(crate) fn write(path: &Path, volume: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     assert!(
         volume.is_ascii() && volume.len() <= 16,
         "a volume's name is short and plain"

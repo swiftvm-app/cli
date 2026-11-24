@@ -1,0 +1,14 @@
+# @NAME@'s guest agent: does in this system what the host asks for, over the virtual machine's
+# socket device. Installed by @NAME@ when the machine was created.
+[Unit]
+Description=@NAME@ guest agent
+
+[Service]
+ExecStart=/usr/local/lib/@NAME@/agent
+Restart=always
+RestartSec=1
+# What the agent runs for the host stays running when the agent is replaced by a newer one.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

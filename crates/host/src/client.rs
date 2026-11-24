@@ -179,3 +179,9 @@ pub(crate) fn stop(directory: &Path, force: bool, timeout: Option<Duration>) -> 
 pub(crate) fn console(directory: &Path) -> Result<UnixStream> {
     ask(directory, &Request::Console, PATIENCE).map(|(stream, _)| stream)
 }
+
+/// A connection to `port` of the guest's socket device.
+pub(crate) fn connect_guest(directory: &Path, port: u32) -> Result<UnixStream> {
+    // The engine takes a few seconds to tell that nothing listens there.
+    ask(directory, &Request::Connect { port }, 3 * PATIENCE).map(|(stream, _)| stream)
+}

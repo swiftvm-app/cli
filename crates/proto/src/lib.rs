@@ -1,8 +1,12 @@
 //! What the host's library, the command and the guest's agent agree on: the product's name, errors
-//! with codes that stay the same, and the messages of a machine's control socket.
+//! with codes that stay the same, the messages of a machine's control socket, and those of the
+//! guest's agent.
 
+pub mod agent;
 mod control;
+pub mod copy;
 mod error;
+pub mod relay;
 
 pub use control::{
     Hello, LONGEST_LINE, OLDEST_PROTOCOL, PROTOCOL, Request, Response, State, Status, agreed, greet, receive,

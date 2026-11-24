@@ -3,7 +3,7 @@
 //! A machine lives on a dispatch queue of its own: the framework wants every call to it made
 //! there, and reports back there. Nothing needs the main thread or a run loop.
 
-use std::os::fd::IntoRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -21,6 +21,9 @@ use crate::{Context, Error, ErrorCode, Result};
 
 /// How long the framework gets to start a machine, or to cut its power.
 const LIMIT: Duration = Duration::from_secs(60);
+/// How long it gets to connect to a port in the guest. It says nothing when nothing listens
+/// there, so this is how long that takes to tell.
+const CONNECT_LIMIT: Duration = Duration::from_secs(5);
 
 pub(crate) struct Machine(Arc<Inner>);
 
@@ -292,5 +295,52 @@ impl Engine for Machine {
                 machine.stopWithCompletionHandler(&handler);
             }
         })?
+    }
+
+    fn connect(&self, port: u32) -> Result<OwnedFd> {
+        let unanswered = || {
+            Error::new(
+                ErrorCode::Guest,
+                format!("Nothing in the guest answers on port {port} of its socket device."),
+            )
+        };
+        let connected = self.ask(CONNECT_LIMIT, move |machine, done| {
+            // Safety: on the machine's queue, with a handler that the framework calls there.
+            unsafe {
+                let devices = machine.socketDevices();
+                let Some(device) = devices
+                    .firstObject()
+                    .and_then(|device| device.downcast::<VZVirtioSocketDevice>().ok())
+                else {
+                    _ = done.send(Err(failed("The machine has no socket device.")));
+                    return;
+                };
+                let handler = RcBlock::new(
+                    move |connection: *mut VZVirtioSocketConnection, error: *mut NSError| {
+                        let result = match connection.as_ref() {
+                            // The connection closes its descriptor when it is let go of, so the
+                            // caller gets one of its own.
+                            Some(connection) => match libc::dup(connection.fileDescriptor()) {
+                                -1 => Err(failed(std::io::Error::last_os_error())),
+                                descriptor => Ok(OwnedFd::from_raw_fd(descriptor)),
+                            },
+                            None => Err(match error.as_ref() {
+                                Some(error) => {
+                                    Error::new(ErrorCode::Guest, error.localizedDescription().to_string())
+                                }
+                                None => failed("The framework didn't connect, and didn't say why."),
+                            }),
+                        };
+                        _ = done.send(result);
+                    },
+                );
+                device.connectToPort_completionHandler(port, &handler);
+            }
+        });
+        match connected {
+            Ok(result) => result,
+            // A guest that doesn't listen gets no answer at all.
+            Err(_) => Err(unanswered()),
+        }
     }
 }

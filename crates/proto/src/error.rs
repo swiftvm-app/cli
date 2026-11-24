@@ -32,6 +32,10 @@ pub enum ErrorCode {
     Protocol,
     /// A file or a socket failed.
     Io,
+    /// The guest's agent doesn't answer, or nothing in the guest listens on a port.
+    Guest,
+    /// Something took longer than it was given.
+    TimedOut,
     /// A code from a newer version.
     #[serde(other)]
     Unknown,

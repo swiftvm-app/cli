@@ -1,6 +1,6 @@
 [package]
 name = "proto"
-description = "The product's name, and the messages of a machine's control socket"
+description = "The product's name, and the messages of a machine's control socket and of the guest's agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,5 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# The streams that `cp` carries, written and read the same way on both ends.
+tar = { version = "0.4", default-features = false }

@@ -1,6 +1,7 @@
 //! The command: creates, starts and stops machines, and is the process of each one that runs.
 
 mod console;
+mod guest;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -22,6 +23,8 @@ fn usage() -> String {
       --disk <size>          The size of its disk. 32G unless said.
       --user <name>          The account to create. This computer's user name unless said.
       --password <password>  The account's password. Without one it has none to sign in with.
+      --script <script>      Set something up once the first start is over: {scripts}, or the
+                             path of a script. Can be given more than once.
   list                       The machines and whether they are running.
   start <machine>            Start a machine. Returns once it has started to boot.
   stop <machine>             Shut a machine down, and cut its power if that takes too long.
@@ -30,17 +33,41 @@ fn usage() -> String {
   delete <machine>           Delete a machine and its disk.
       --force                Also when it is running.
   console <machine>          Connect this terminal to a machine's serial console.
+  info <machine>             A machine, and what its guest says about itself.
+  wait <machine>             Wait until the guest is up and its setup scripts have run.
+      --timeout <seconds>    How long to wait. As long as it takes unless said.
+  exec <machine> -- <command> [arguments]
+                             Run a command in the guest. Input that is piped in is passed on.
+                             Ends with the command's exit status.
+      --user <name>          The account to run it as. The machine's own unless said.
+      --cwd <folder>         Where to run it. The account's home folder unless said.
+      --env <name=value>     Add to its environment. Can be given more than once.
+      --timeout <seconds>    End it after this long, with exit status 124.
+  cp <from> <to>             Copy a file or folder into or out of a guest, as cp -R does. The
+                             guest's side is written <machine>:<path>, from the home folder.
+      --user <name>          The account that the copy is made as.
+  ssh <machine> [-- <arguments for ssh>]
+                             Sign in to the guest with ssh, through its agent.
+  forward <machine> <port>[:<guest port>]...
+                             Pass connections to ports of this computer's localhost on to ports
+                             of the guest, until stopped.
+  tunnel <machine> <port>    Connect this program's input and output to a port of the guest, as
+                             ssh's ProxyCommand does.
   version
 
 Every command takes --json, and then prints one JSON document: its result, or
-{{\"error\": {{\"code\": ..., \"message\": ...}}}}."
+{{\"error\": {{\"code\": ..., \"message\": ...}}}}.",
+        scripts = host::setup_scripts().join(", ")
     )
 }
 
 /// The words of a command line, sorted into what they are.
 struct Arguments {
     positional: Vec<String>,
-    options: HashMap<String, String>,
+    /// Each option's values, in the order they were given.
+    options: HashMap<String, Vec<String>>,
+    /// What follows `--`.
+    rest: Vec<String>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -53,9 +80,14 @@ impl Arguments {
         let mut arguments = Self {
             positional: Vec::new(),
             options: HashMap::new(),
+            rest: Vec::new(),
         };
         let mut words = words.iter();
         while let Some(word) = words.next() {
+            if word == "--" {
+                arguments.rest = words.cloned().collect();
+                break;
+            }
             let Some(option) = word.strip_prefix("--").filter(|option| !option.is_empty()) else {
                 arguments.positional.push(word.clone());
                 continue;
@@ -74,7 +106,7 @@ impl Arguments {
             } else {
                 return Err(invalid(format!("This command has no option --{name}.")));
             };
-            arguments.options.insert(name.to_string(), value);
+            arguments.options.entry(name.to_string()).or_default().push(value);
         }
         Ok(arguments)
     }
@@ -83,12 +115,17 @@ impl Arguments {
         self.options.contains_key(name)
     }
 
+    /// The option's value, the last one if it was given more than once.
     fn value(&self, name: &str) -> Option<String> {
-        self.options.get(name).cloned()
+        self.options.get(name).and_then(|values| values.last()).cloned()
+    }
+
+    fn values(&self, name: &str) -> Vec<String> {
+        self.options.get(name).cloned().unwrap_or_default()
     }
 
     fn number<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>> {
-        match self.options.get(name) {
+        match self.value(name) {
             None => Ok(None),
             Some(value) => value
                 .parse()
@@ -137,6 +174,17 @@ fn parse_size(text: &str) -> Result<u64> {
             "\"{text}\" isn't a size. Write one like 4G or 512M."
         ))),
     }
+}
+
+/// `text` without the characters that a terminal takes for orders, or that turn the direction of
+/// the text around: what a guest says can be anything, and is shown as text.
+fn plain(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(character, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect()
 }
 
 /// A size as it is shown: `512 MiB`, `1.5 GiB`.
@@ -246,14 +294,26 @@ fn machine_row(machine: &Machine) -> Vec<String> {
     ]
 }
 
-/// Runs a command. Returns what `--json` prints.
-fn run(command: &str, words: &[String], json: bool) -> Result<serde_json::Value> {
+/// What a command that worked has to show: what `--json` prints, and the exit status.
+struct Done {
+    result: serde_json::Value,
+    status: u8,
+}
+
+impl From<serde_json::Value> for Done {
+    fn from(result: serde_json::Value) -> Self {
+        Self { result, status: 0 }
+    }
+}
+
+/// Runs a command.
+fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
     let say = |text: String| {
         if !json {
             println!("{text}");
         }
     };
-    match command {
+    let result = match command {
         "images" => {
             Arguments::parse(words, &[], &[])?.nothing_else()?;
             let images = Host::open()?.images();
@@ -273,7 +333,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<serde_json::Value>
         "create" => {
             let arguments = Arguments::parse(
                 words,
-                &["name", "cpus", "memory", "disk", "user", "password"],
+                &["name", "cpus", "memory", "disk", "user", "password", "script"],
                 &[],
             )?;
             let options = CreateOptions {
@@ -284,6 +344,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<serde_json::Value>
                 disk: arguments.value("disk").as_deref().map(parse_size).transpose()?,
                 user: arguments.value("user"),
                 password: arguments.value("password"),
+                scripts: arguments.values("script"),
             };
             let host = Host::open()?;
             let mut meter = Meter {
@@ -363,10 +424,14 @@ fn run(command: &str, words: &[String], json: bool) -> Result<serde_json::Value>
             // What follows is the guest's text, with --json as without it.
             console::run(stream, name)
         }
+        "info" | "wait" | "exec" | "cp" | "ssh" | "forward" | "tunnel" => {
+            return guest::run(command, words, json);
+        }
         _ => Err(invalid(format!(
             "{NAME} has no command \"{command}\". `{NAME} help` lists the commands."
         ))),
-    }
+    };
+    result.map(Done::from)
 }
 
 fn main() -> ExitCode {
@@ -377,8 +442,12 @@ fn main() -> ExitCode {
             None => ExitCode::from(2),
         };
     }
-    let json = words.iter().any(|word| word == "--json");
+    // Not among what follows `--`, which is the guest's.
+    let own = words.iter().position(|word| word == "--").unwrap_or(words.len());
+    let json = words[..own].iter().any(|word| word == "--json");
+    let rest = words.split_off(own);
     words.retain(|word| word != "--json");
+    words.extend(rest);
     let Some(command) = words.first().cloned() else {
         eprintln!("{}", usage());
         return ExitCode::from(2);
@@ -402,17 +471,17 @@ fn main() -> ExitCode {
         _ => {}
     }
     match run(&command, &words[1..], json) {
-        Ok(result) => {
-            if json && !result.is_null() {
-                println!("{result}");
+        Ok(done) => {
+            if json && !done.result.is_null() {
+                println!("{}", done.result);
             }
-            ExitCode::SUCCESS
+            ExitCode::from(done.status)
         }
         Err(error) => {
             if json {
                 println!("{}", json!({ "error": error }));
             } else {
-                eprintln!("{NAME}: {error}");
+                eprintln!("{NAME}: {}", plain(&error.message));
             }
             // A command that was written wrongly ends as the usage does.
             ExitCode::from(if error.code == ErrorCode::InvalidArgument {

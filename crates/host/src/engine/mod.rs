@@ -48,6 +48,9 @@ pub(crate) trait Engine: Send + Sync {
 
     /// Cuts the power. Returns once the machine is off, also when it was off already.
     fn stop(&self) -> Result<()>;
+
+    /// A connection to `port` of the guest's socket device.
+    fn connect(&self, port: u32) -> Result<OwnedFd>;
 }
 
 #[cfg(target_os = "macos")]

@@ -47,6 +47,13 @@ pub(crate) struct ProcessFile {
     pub started: u64,
 }
 
+/// What a connection carries once a request has been answered, other than more requests.
+enum Then {
+    Console,
+    /// A connection to a port in the guest, a stream socket.
+    Relay(UnixStream),
+}
+
 struct Phase {
     state: State,
     /// Why the machine stopped, if something went wrong.
@@ -151,6 +158,8 @@ impl Service {
                 Err(_) => return,
             };
             self.answering.fetch_add(1, Ordering::SeqCst);
+            let stopped = || Response::failed(Error::new(ErrorCode::NotRunning, "The machine has stopped."));
+            let mut then = None;
             let response = match request {
                 Request::Status => Response::done(Some(self.status())),
                 Request::Stop { force, timeout } => {
@@ -160,19 +169,30 @@ impl Service {
                         Err(error) => Response::failed(error),
                     }
                 }
-                Request::Console if self.shared.state() == State::Stopped => {
-                    Response::failed(Error::new(ErrorCode::NotRunning, "The machine has stopped."))
+                Request::Console if self.shared.state() == State::Stopped => stopped(),
+                Request::Connect { .. } if self.shared.state() != State::Running => stopped(),
+                Request::Console => {
+                    then = Some(Then::Console);
+                    Response::done(None)
                 }
-                Request::Console => Response::done(None),
+                Request::Connect { port } => match self.engine.connect(port) {
+                    Ok(guest) => {
+                        then = Some(Then::Relay(UnixStream::from(guest)));
+                        Response::done(None)
+                    }
+                    Err(error) => Response::failed(error),
+                },
             };
             let sent = proto::send(&mut stream, &response);
             self.answering.fetch_sub(1, Ordering::SeqCst);
             if sent.is_err() {
                 return;
             }
-            if request == Request::Console && response.ok {
-                // From here on the connection carries the console.
-                return self.console.attach(stream);
+            match then {
+                // From here on the connection carries the console, or the guest's connection.
+                Some(Then::Console) => return self.console.attach(stream),
+                Some(Then::Relay(guest)) => return proto::relay::relay(stream, guest),
+                None => {}
             }
         }
     }
