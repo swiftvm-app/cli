@@ -8,4 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true
+crc32fast.workspace = true
+graviola.workspace = true
+zstd.workspace = true

@@ -1,6 +1,7 @@
 //! The command: creates, starts and stops machines, and is the process of each one that runs.
 
 mod console;
+mod disk;
 mod guest;
 
 use std::collections::HashMap;
@@ -53,6 +54,10 @@ fn usage() -> String {
                              of the guest, until stopped.
   tunnel <machine> <port>    Connect this program's input and output to a port of the guest, as
                              ssh's ProxyCommand does.
+  disk info <machine>        The layers of a machine's disk, and what each holds. Takes the path
+                             of a .layer file too.
+  disk check <machine>       Read every layer of a stopped machine's disk back and check it. Ends
+                             with status 1 if anything is wrong.
   version
 
 Every command takes --json, and then prints one JSON document: its result, or
@@ -251,7 +256,9 @@ impl Meter {
                 received,
                 total: None,
             } => ("Downloading the image", size(received)),
-            Progress::WritingDisk { fraction } => ("Writing the disk", format!("{:.0}%", fraction * 100.0)),
+            Progress::WritingDisk { fraction } => {
+                ("Preparing the image", format!("{:.0}%", fraction * 100.0))
+            }
         };
         let is_new = self.step != Some(step);
         self.step = Some(step);
@@ -427,6 +434,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
         "info" | "wait" | "exec" | "cp" | "ssh" | "forward" | "tunnel" => {
             return guest::run(command, words, json);
         }
+        "disk" => return disk::run(words, json),
         _ => Err(invalid(format!(
             "{NAME} has no command \"{command}\". `{NAME} help` lists the commands."
         ))),

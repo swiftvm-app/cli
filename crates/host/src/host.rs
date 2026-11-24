@@ -13,15 +13,16 @@ use serde::Serialize;
 
 use crate::images::{self, ARCH};
 use crate::lock::Lock;
+use crate::paths::socket_path;
 use crate::process::SEED_FILE;
 use crate::scripts::Script;
 use crate::seed::{self, Seed};
 use crate::store::{self, Config, DiskConfig, DiskFormat, LOCK, Store};
 use crate::{
-    AGENT, Context, Error, ErrorCode, NAME, Result, client, download, guest, import, now, random_hex,
+    AGENT, Context, Error, ErrorCode, NAME, Result, client, download, guest, layers, now, random_hex,
 };
 
-const DISK_FILE: &str = "disk.raw";
+const DISK_FILE: &str = "disk.layer";
 const DEFAULT_CPUS: u32 = 4;
 const DEFAULT_MEMORY: u64 = 4 << 30;
 const DEFAULT_DISK: u64 = 32 << 30;
@@ -74,7 +75,8 @@ pub struct ExecOptions {
 pub enum Progress {
     /// The image is on its way: bytes that have arrived, and of how many if the server said.
     Downloading { received: u64, total: Option<u64> },
-    /// The disk is being written, from 0 to 1.
+    /// The image is being made into the layer that its machines' disks are built on, from 0 to
+    /// 1. That is done once for each image.
     WritingDisk { fraction: f64 },
 }
 
@@ -106,8 +108,10 @@ pub struct Machine {
     pub memory: u64,
     /// What the guest sees of its disk, in bytes.
     pub disk_size: u64,
-    /// What the disk takes up on this computer, in bytes.
+    /// What the machine's own layer of its disk takes up on this computer, in bytes.
     pub disk_used: u64,
+    /// What the layers its disk is built on take up, in bytes. Other machines share them.
+    pub disk_shared: u64,
     pub user: String,
     /// Seconds since 1970.
     pub created: u64,
@@ -119,6 +123,73 @@ pub struct ImageSummary {
     pub id: String,
     pub name: String,
     pub cached: bool,
+}
+
+/// A disk, as its layers: its own first, then those it is built on.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskInfo {
+    /// The machine whose disk it is, if it was asked for by its machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub layers: Vec<LayerInfo>,
+}
+
+/// A layer of a disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerInfo {
+    pub path: PathBuf,
+    /// The SHA-256 of its file, which names a sealed layer in the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// A sealed layer is never written again.
+    pub sealed: bool,
+    /// The size of the disk in bytes.
+    pub capacity: u64,
+    /// What its file takes up on this computer, in bytes.
+    pub file_bytes: u64,
+    /// The layers and the machines' disks that are built on it.
+    pub used_by: usize,
+    /// What it holds. Left out for the layer of a machine that is running, which is being written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<LayerContents>,
+}
+
+/// What a layer holds, in clusters of 64 KiB.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerContents {
+    pub clusters: u64,
+    /// Clusters with data of their own.
+    pub stored: u64,
+    /// Clusters that it says are zeros, over what is underneath.
+    pub zeros: u64,
+    /// Clusters that read what is underneath, or zeros where there is nothing.
+    pub inherited: u64,
+    /// What the stored clusters take up, compressed, in bytes.
+    pub stored_bytes: u64,
+}
+
+/// What a check of a disk found, layer by layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskCheck {
+    pub layers: Vec<LayerCheck>,
+}
+
+impl DiskCheck {
+    pub fn is_whole(&self) -> bool {
+        self.layers.iter().all(|layer| layer.problems.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LayerCheck {
+    pub path: PathBuf,
+    /// What is wrong with it: nothing, for a layer that is whole.
+    pub problems: Vec<String>,
+}
+
+/// The hash that a sealed layer's file is named by.
+fn named_hash(path: &Path) -> Option<[u8; 32]> {
+    disk::layer::from_hex(&path.file_stem()?.to_string_lossy())
 }
 
 /// The process that runs the machine in `directory`, if one does.
@@ -135,7 +206,13 @@ fn running_process(directory: &Path) -> Option<u32> {
     (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
 }
 
-fn summary(directory: &Path, name: &str) -> Machine {
+/// What a file takes up on this computer, in bytes.
+fn allocated(path: &Path) -> u64 {
+    // Blocks are counted in units of 512 bytes, whatever the file system's own are.
+    std::fs::metadata(path).map_or(0, |metadata| metadata.blocks() * 512)
+}
+
+fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
     let pid = running_process(directory);
     let running = pid.is_some();
     let mut machine = Machine {
@@ -154,14 +231,18 @@ fn summary(directory: &Path, name: &str) -> Machine {
         memory: 0,
         disk_size: 0,
         disk_used: 0,
+        disk_shared: 0,
         user: String::new(),
         created: 0,
     };
     match Config::load(directory) {
         Ok(config) => {
-            // Blocks are counted in units of 512 bytes, whatever the file system's own are.
-            machine.disk_used =
-                std::fs::metadata(directory.join(&config.disk.file)).map_or(0, |disk| disk.blocks() * 512);
+            let disk = directory.join(&config.disk.file);
+            machine.disk_used = allocated(&disk);
+            if config.disk.format == DiskFormat::Layer {
+                let chain = layers::chain(store, &disk).unwrap_or_default();
+                machine.disk_shared = chain.iter().map(|layer| allocated(layer)).sum();
+            }
             machine.id = config.id;
             machine.image = config.image;
             machine.arch = config.arch;
@@ -234,12 +315,12 @@ impl Host {
         let names = self.store.names()?;
         Ok(names
             .iter()
-            .map(|name| summary(&self.store.directory(name), name))
+            .map(|name| summary(&self.store, &self.store.directory(name), name))
             .collect())
     }
 
     pub fn machine(&self, name: &str) -> Result<Machine> {
-        Ok(summary(&self.store.find(name)?, name))
+        Ok(summary(&self.store, &self.store.find(name)?, name))
     }
 
     /// Creates a machine, downloading its image unless the cache has it. The machine isn't
@@ -287,10 +368,22 @@ impl Host {
         let file = download::fetch(&self.cache, &image, &mut |received, total| {
             progress(Progress::Downloading { received, total })
         })?;
-        let mut staged = self.store.stage()?;
-        import::install(&file, &staged.directory.join(DISK_FILE), disk, &mut |fraction| {
+        let base = layers::base(&self.store, &image, &file, &mut |fraction| {
             progress(Progress::WritingDisk { fraction })
         })?;
+        let base_size = disk::Header::read(&layers::path(&self.store, &base))
+            .at("read", &layers::path(&self.store, &base))?
+            .capacity;
+        if base_size > disk {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!("The image needs a disk of {base_size} bytes, and {disk} were asked for."),
+            ));
+        }
+        let mut staged = self.store.stage()?;
+        // The guest grows its system into the room that is left when it first starts.
+        let layer = staged.directory.join(DISK_FILE);
+        disk::Layer::create(&layer, disk, Some(base)).at("create", &layer)?;
         let mut config = Config {
             version: store::CONFIG_VERSION,
             id: random_hex(16)?,
@@ -301,7 +394,7 @@ impl Host {
             memory,
             disk: DiskConfig {
                 file: DISK_FILE.to_string(),
-                format: DiskFormat::Raw,
+                format: DiskFormat::Layer,
                 size: disk,
             },
             mac_address: mac_address()?,
@@ -339,7 +432,7 @@ impl Host {
             seed.write(&staged.directory.join(SEED_FILE))?;
             config.save(&staged.directory)?;
             match self.store.publish(&mut staged, &name) {
-                Ok(directory) => return Ok(summary(&directory, &name)),
+                Ok(directory) => return Ok(summary(&self.store, &directory, &name)),
                 // Someone else took the name in the meantime. Another one will do.
                 Err(error) if error.code == ErrorCode::AlreadyExists && options.name.is_none() => {}
                 Err(error) => return Err(error),
@@ -433,11 +526,17 @@ impl Host {
                 ));
             }
         };
-        // A socket that had no room in the machine's folder isn't removed with it.
+        // Sockets that had no room in the machine's folder aren't removed with it.
         if let Some(process) = client::process_file(&directory)
             && !process.socket.starts_with(&directory)
         {
             _ = std::fs::remove_file(process.socket);
+        }
+        if let Ok(config) = Config::load(&directory)
+            && let Ok(socket) = socket_path(&directory, &config.id, "disk")
+            && !socket.starts_with(&directory)
+        {
+            _ = std::fs::remove_file(socket);
         }
         self.store.remove(&directory, stopped)
     }
@@ -584,5 +683,123 @@ impl Host {
             }
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+
+    /// The layer file of a disk: of the machine called `target`, or the file at that path if it
+    /// has a `/` in it or ends in `.layer`. Says which machine, and whether it is running.
+    fn disk_target(&self, target: &str) -> Result<(Option<String>, PathBuf, bool)> {
+        if target.contains('/') || target.ends_with(".layer") {
+            let path = PathBuf::from(target);
+            if !path.is_file() {
+                return Err(Error::new(
+                    ErrorCode::NotFound,
+                    format!("There is no layer at {target}."),
+                ));
+            }
+            return Ok((None, path, false));
+        }
+        let directory = self.store.find(target)?;
+        let config = Config::load(&directory)?;
+        if config.disk.format != DiskFormat::Layer {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                format!("\"{target}\" has a raw disk, which has no layers."),
+            ));
+        }
+        let running = running_process(&directory).is_some();
+        Ok((
+            Some(target.to_string()),
+            directory.join(config.disk.file),
+            running,
+        ))
+    }
+
+    /// The layers of a machine's disk, or of the layer file at a path, and what each holds.
+    pub fn disk_info(&self, target: &str) -> Result<DiskInfo> {
+        let (machine, top, running) = self.disk_target(target)?;
+        let users = layers::users(&self.store);
+        let mut files = vec![top.clone()];
+        files.extend(layers::chain(&self.store, &top)?);
+        // A layer that is being written is left alone: what it says is changing as it is read.
+        let opened = match (running, files.get(1)) {
+            (false, _) => Some(layers::open(&self.store, &top, &disk::Options::read_only())?),
+            (true, Some(parent)) => Some(layers::open(&self.store, parent, &disk::Options::read_only())?),
+            (true, None) => None,
+        };
+        let mut open = std::iter::successors(opened, |layer| layer.parent().cloned());
+        let mut layers = Vec::new();
+        for (index, file) in files.into_iter().enumerate() {
+            let header = disk::Header::read(&file).at("read", &file)?;
+            let hash = named_hash(&file).filter(|_| header.sealed);
+            let contents = if index == 0 && running {
+                None
+            } else {
+                open.next().map(|layer| {
+                    let stats = layer.stats();
+                    LayerContents {
+                        clusters: stats.clusters,
+                        stored: stats.stored,
+                        zeros: stats.zeros,
+                        inherited: stats.inherited,
+                        stored_bytes: stats.stored_bytes,
+                    }
+                })
+            };
+            layers.push(LayerInfo {
+                used_by: hash.and_then(|hash| users.get(&hash)).copied().unwrap_or(0),
+                hash: hash.map(|hash| disk::layer::to_hex(&hash)),
+                sealed: header.sealed,
+                capacity: header.capacity,
+                file_bytes: allocated(&file),
+                contents,
+                path: file,
+            });
+        }
+        Ok(DiskInfo { machine, layers })
+    }
+
+    /// Reads every layer of a disk back, and says what is wrong with each. A machine has to be
+    /// stopped for it.
+    pub fn check_disk(&self, target: &str) -> Result<DiskCheck> {
+        let (_, top, running) = self.disk_target(target)?;
+        if running {
+            return Err(Error::new(
+                ErrorCode::Running,
+                format!("\"{target}\" is running. Stop it first."),
+            ));
+        }
+        // A layer that can't be opened, its own or one it is built on, is a finding like any other.
+        let opened = layers::chain(&self.store, &top).and_then(|chain| {
+            let layer = layers::open(&self.store, &top, &disk::Options::read_only())?;
+            Ok((chain, layer))
+        });
+        let mut files = vec![top.clone()];
+        let layer = match opened {
+            Ok((chain, layer)) => {
+                files.extend(chain);
+                layer
+            }
+            Err(error) => {
+                return Ok(DiskCheck {
+                    layers: vec![LayerCheck {
+                        path: top,
+                        problems: vec![error.message],
+                    }],
+                });
+            }
+        };
+        let mut checks = Vec::new();
+        let chain = std::iter::successors(Some(layer), |layer| layer.parent().cloned());
+        for (file, layer) in files.into_iter().zip(chain) {
+            let mut problems = layer.verify().at("read", &file)?;
+            if layer.header().sealed
+                && let Some(named) = named_hash(&file)
+                && disk::layer::hash_file(&file).at("read", &file)? != named
+            {
+                problems.push("its contents don't match the hash it is named by".into());
+            }
+            checks.push(LayerCheck { path: file, problems });
+        }
+        Ok(DiskCheck { layers: checks })
     }
 }

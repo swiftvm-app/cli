@@ -120,10 +120,13 @@ impl<'a> Qcow2<'a> {
         }
     }
 
-    /// Writes the disk to `output`, which is as large as the disk and all zeros. Clusters of
-    /// zeros aren't written, so that the file stays sparse. `progress` is told how far along
-    /// this is, from 0 to 1.
-    pub fn write_raw(&self, output: &File, progress: &mut dyn FnMut(f64)) -> Result<()> {
+    /// Passes each cluster of the disk that holds something to `output`, with where it goes, in
+    /// order. What isn't passed is zeros. `progress` is told how far along this is, from 0 to 1.
+    pub fn read_into(
+        &self,
+        output: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<()> {
         let cluster_size = 1usize << self.cluster_bits;
         let l2_entries = (cluster_size / 8) as u64;
         const OFFSET: u64 = 0x00FF_FFFF_FFFF_FE00;
@@ -188,11 +191,7 @@ impl<'a> Qcow2<'a> {
                     continue;
                 }
                 let length = (self.virtual_size - guest_offset).min(cluster_size as u64) as usize;
-                output
-                    .write_all_at(&cluster[..length], guest_offset)
-                    .map_err(|error| {
-                        Error::new(ErrorCode::Io, format!("Couldn't write the disk: {error}."))
-                    })?;
+                output(guest_offset, &cluster[..length])?;
             }
         }
         progress(1.0);
@@ -202,7 +201,7 @@ impl<'a> Qcow2<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::Write;
 
     use super::*;
 
@@ -253,22 +252,19 @@ mod tests {
             .open(directory.join("image.qcow2"))
             .unwrap();
         source.write_all(&image).unwrap();
-        let mut output = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(directory.join("disk.raw"))
-            .unwrap();
-        output.set_len(virtual_size).unwrap();
-
         let qcow2 = Qcow2::open(&source).unwrap().expect("a QCOW2 image");
         assert_eq!(qcow2.virtual_size, virtual_size);
-        qcow2.write_raw(&output, &mut |_| {}).unwrap();
+        let mut raw = vec![0; virtual_size as usize];
+        qcow2
+            .read_into(
+                &mut |offset, bytes| {
+                    raw[offset as usize..][..bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                },
+                &mut |_| {},
+            )
+            .unwrap();
 
-        let mut raw = Vec::new();
-        output.seek(SeekFrom::Start(0)).unwrap();
-        output.read_to_end(&mut raw).unwrap();
         let mut expected = [plain, squeezed, vec![0; 2 * CLUSTER], last].concat();
         expected.truncate(virtual_size as usize);
         assert!(raw == expected);

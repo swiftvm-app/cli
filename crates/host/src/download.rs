@@ -50,6 +50,12 @@ pub(crate) fn cached(cache: &Path, image: &Image) -> Option<PathBuf> {
     (checked.url == image.url && checked.size == size).then_some(file)
 }
 
+/// The checksum that the checked image at `file` in the cache was found to have.
+pub(crate) fn digest_of(file: &Path) -> Option<String> {
+    let checked: Checked = serde_json::from_slice(&std::fs::read(beside(file, ".json")).ok()?).ok()?;
+    Some(checked.digest)
+}
+
 /// Returns the file of `image` in the cache, downloading and checking it if it isn't there yet.
 /// `progress` is told how many bytes have arrived, and of how many if the server said.
 pub(crate) fn fetch(

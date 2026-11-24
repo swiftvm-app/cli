@@ -13,6 +13,7 @@ mod host;
 mod images;
 mod import;
 mod iso;
+mod layers;
 mod lock;
 mod paths;
 pub mod process;
@@ -21,7 +22,11 @@ mod scripts;
 mod seed;
 mod store;
 
-pub use host::{CreateOptions, ExecOptions, Host, ImageSummary, Machine, MachineState, Progress};
+pub use disk::layer::CLUSTER as LAYER_CLUSTER;
+pub use host::{
+    CreateOptions, DiskCheck, DiskInfo, ExecOptions, Host, ImageSummary, LayerCheck, LayerInfo, Machine,
+    MachineState, Progress,
+};
 pub use paths::{cache_directory, home_directory};
 pub use proto::agent::{Address, Ended, GuestInfo, Setup, SetupState};
 pub use proto::relay::relay;

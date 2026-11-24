@@ -1,8 +1,15 @@
 //! Virtual disks, and the servers that hand them to a virtualization engine.
+//!
+//! A machine's disk is a chain of [`Layer`]s: its own, which takes its writes, on top of sealed
+//! layers that are only read and that other machines may share.
 
+mod allocator;
+pub mod layer;
 pub mod nbd;
 mod raw;
+pub mod storage;
 
+pub use layer::{Header, Layer, Options, Stats};
 pub use raw::RawDisk;
 
 use std::io;

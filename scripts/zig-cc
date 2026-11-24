@@ -1,0 +1,13 @@
+#!/bin/sh
+# A C compiler for Linux targets on a Mac, for the C in zstd: `zig cc` with the target in
+# ZIG_TARGET. cc-rs also passes Rust's own name for the target, which zig doesn't read.
+set -eu
+[ -n "${ZIG_TARGET:-}" ] || { echo "zig-cc: set ZIG_TARGET, such as aarch64-linux-musl" >&2; exit 1; }
+for argument in "$@"; do
+    case $argument in
+        --target=*) ;;
+        *) set -- "$@" "$argument" ;;
+    esac
+    shift
+done
+exec zig cc -target "$ZIG_TARGET" "$@"

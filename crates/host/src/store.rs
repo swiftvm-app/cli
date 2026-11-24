@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! <store>/lock                  held while the set of machines changes
+//! <store>/layers/               sealed layers that machines' disks are built on (`layers`)
 //! <store>/machines/<name>/      a machine
 //!     config.json               what it is made of
-//!     disk.raw  seed.iso        its disk, and what sets it up on its first start
+//!     disk.layer  seed.iso      its disk, and what sets it up on its first start
 //!     lock                      held by its process for as long as it runs
 //!     process.json              that process and its socket
 //!     console.log  machine.log  what the guest printed, and what its process had to say
@@ -22,7 +23,8 @@ use crate::lock::Lock;
 use crate::{Context, Error, ErrorCode, Result, random_hex};
 
 /// The newest layout of `config.json` that this build reads, and the one it writes.
-pub(crate) const CONFIG_VERSION: u32 = 1;
+/// 2 brought disks of layers, which a program that reads 1 doesn't know.
+pub(crate) const CONFIG_VERSION: u32 = 2;
 
 /// What a machine is made of: its `config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +62,10 @@ pub struct DiskConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskFormat {
+    /// A raw image, attached as a file. Machines of the first versions have one.
     Raw,
+    /// A layer of its own, on sealed layers in the store.
+    Layer,
 }
 
 impl Config {

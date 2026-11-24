@@ -19,6 +19,12 @@ disk = { path = "crates/disk" }
 host = { path = "crates/host" }
 proto = { path = "crates/proto" }
 libc = "0.2"
+# Checksums and SHA-2 without a C compiler.
+crc32fast = "1"
+graviola = "0.4"
+# The C library: it has every level, which the pure Rust one doesn't. Building it for Linux on a Mac
+# takes a C compiler for that target: scripts/zig-cc.
+zstd = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

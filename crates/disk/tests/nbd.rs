@@ -92,3 +92,58 @@ fn serves_reads_and_writes_and_refuses_what_is_out_of_range() {
     std::fs::remove_file(&image).unwrap();
     std::fs::remove_dir(&folder).unwrap();
 }
+
+/// A machine's disk as the machine's process serves it: its own layer on a sealed one.
+#[test]
+fn serves_a_layer_on_another() {
+    use disk::layer::{CLUSTER, hash_file};
+    use disk::{Disk, Layer, Options};
+
+    let folder = std::env::temp_dir().join(format!("disk-nbd-layers-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let base = folder.join("base.layer");
+    Layer::create(&base, 4 * CLUSTER as u64, None).unwrap();
+    let text: Vec<u8> = (0..4 * CLUSTER).map(|index| b"underneath "[index % 11]).collect();
+    let layer = Layer::open(&base, &Options::default(), None).unwrap();
+    layer.write(0, &text).unwrap();
+    layer.seal().unwrap();
+    let hash = hash_file(&base).unwrap();
+
+    let top = folder.join("disk.layer");
+    let capacity = 8 * CLUSTER;
+    Layer::create(&top, capacity as u64, Some(hash)).unwrap();
+    let open = || {
+        let parent = Arc::new(Layer::open(&base, &Options::read_only(), None).unwrap());
+        Arc::new(Layer::open(&top, &Options::default(), Some(parent)).unwrap())
+    };
+    let layer = open();
+    let socket = folder.join("disk.sock");
+    let mut server = Server::start(layer.clone(), &socket).unwrap();
+    let (mut client, served) = Client::connect(&socket);
+    assert_eq!(served, capacity as u64);
+
+    let mut expected = text.clone();
+    expected.resize(capacity, 0);
+    assert_eq!(client.ask(1, 5000, 5, b"hello").0, 0);
+    expected[5000..5005].copy_from_slice(b"hello");
+    // A trim of a whole cluster underneath, and zeros over part of another.
+    assert_eq!(client.ask(4, CLUSTER as u64, CLUSTER as u32, &[]).0, 0);
+    expected[CLUSTER..2 * CLUSTER].fill(0);
+    assert_eq!(client.ask(6, 3 * CLUSTER as u64 + 7, 100, &[]).0, 0);
+    expected[3 * CLUSTER + 7..3 * CLUSTER + 107].fill(0);
+    assert_eq!(client.ask(3, 0, 0, &[]).0, 0);
+    assert_eq!(client.ask(0, 0, capacity as u32, &[]), (0, expected.clone()));
+
+    server.stop();
+    layer.close().unwrap();
+    drop(layer);
+    let layer = open();
+    assert_eq!(layer.replayed_changes(), 0);
+    let mut read = vec![0; capacity];
+    layer.read(0, &mut read).unwrap();
+    assert!(read == expected);
+    assert_eq!(hash_file(&base).unwrap(), hash);
+    layer.close().unwrap();
+    std::fs::remove_dir_all(&folder).unwrap();
+}

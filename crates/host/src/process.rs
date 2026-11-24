@@ -19,11 +19,11 @@ use proto::{Request, Response, State, Status};
 use serde::{Deserialize, Serialize};
 
 use crate::console::Console;
-use crate::engine::{self, Engine, Spec};
+use crate::engine::{self, DiskAttachment, Engine, Spec};
 use crate::lock::Lock;
 use crate::paths::socket_path;
-use crate::store::{Config, LOCK};
-use crate::{Context, Error, ErrorCode, Result, now};
+use crate::store::{Config, DiskFormat, LOCK, Store};
+use crate::{Context, Error, ErrorCode, Result, layers, now};
 
 /// The first argument that makes the program a machine's process. The second is the machine's
 /// folder. A program that embeds this library passes both on to [`run`].
@@ -198,6 +198,43 @@ impl Service {
     }
 }
 
+/// A machine's disk of layers, served to its engine for as long as this lives.
+struct ServedDisk {
+    server: disk::nbd::Server,
+    layer: Arc<disk::Layer>,
+}
+
+impl ServedDisk {
+    fn start(directory: &Path, config: &Config) -> Result<Self> {
+        // The machine's folder is <store>/machines/<name>.
+        let store = directory
+            .parent()
+            .and_then(Path::parent)
+            .map(Store::new)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidArgument,
+                    "The machine's folder isn't in a store.",
+                )
+            })?;
+        let path = directory.join(&config.disk.file);
+        let layer = layers::open(&store, &path, &disk::Options::default())?;
+        let socket = socket_path(directory, &config.id, "disk")?;
+        let server = disk::nbd::Server::start(layer.clone(), &socket).at("serve the disk on", &socket)?;
+        Ok(Self { server, layer })
+    }
+}
+
+impl Drop for ServedDisk {
+    fn drop(&mut self) {
+        self.server.stop();
+        // What can't be committed now is in the layer's journal, and comes back the next time.
+        if let Err(error) = self.layer.close() {
+            _ = std::io::stderr().write_all(format!("Couldn't close the disk: {error}.\n").as_bytes());
+        }
+    }
+}
+
 static TERMINATED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn terminated(_signal: libc::c_int) {
@@ -252,10 +289,19 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     });
     let (console, guest_end) = Console::open(&directory.join("console.log"))?;
     let seed = directory.join(SEED_FILE);
+    // Closed when this returns, after the machine has stopped and before its lock is let go of.
+    let served = match config.disk.format {
+        DiskFormat::Raw => None,
+        DiskFormat::Layer => Some(ServedDisk::start(directory, &config)?),
+    };
+    let disk = match &served {
+        Some(served) => DiskAttachment::Network(served.server.url()),
+        None => DiskAttachment::File(directory.join(&config.disk.file)),
+    };
     let spec = Spec {
         cpus: config.cpus,
         memory: config.memory,
-        disk: directory.join(&config.disk.file),
+        disk,
         seed: seed.exists().then_some(seed),
         mac_address: config.mac_address.clone(),
         directory: directory.to_owned(),
@@ -334,6 +380,7 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     while service.answering.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+    drop(served);
     forget();
     match service.shared.phase.lock().unwrap().failure.take() {
         Some(failure) => Err(Error::new(

@@ -83,7 +83,16 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                     ("Memory", size(machine.memory)),
                     (
                         "Disk",
-                        format!("{} of {}", size(machine.disk_used), size(machine.disk_size)),
+                        if machine.disk_shared > 0 {
+                            format!(
+                                "{} of {}, on {} that is shared",
+                                size(machine.disk_used),
+                                size(machine.disk_size),
+                                size(machine.disk_shared)
+                            )
+                        } else {
+                            format!("{} of {}", size(machine.disk_used), size(machine.disk_size))
+                        },
                     ),
                     ("Account", machine.user.clone()),
                 ];

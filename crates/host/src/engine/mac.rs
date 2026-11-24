@@ -16,7 +16,7 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_virtualization::*;
 
-use super::{Engine, Spec, Stopped};
+use super::{DiskAttachment, Engine, Spec, Stopped};
 use crate::{Context, Error, ErrorCode, Result};
 
 /// How long the framework gets to start a machine, or to cut its power.
@@ -24,6 +24,8 @@ const LIMIT: Duration = Duration::from_secs(60);
 /// How long it gets to connect to a port in the guest. It says nothing when nothing listens
 /// there, so this is how long that takes to tell.
 const CONNECT_LIMIT: Duration = Duration::from_secs(5);
+/// How long the framework waits for the server of the machine's disk to answer a request.
+const DISK_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct Machine(Arc<Inner>);
 
@@ -145,15 +147,32 @@ fn configuration(spec: Spec) -> Result<Retained<VZVirtualMachineConfiguration>> 
         loader.setVariableStore(Some(&variables));
         configuration.setBootLoader(Some(&loader));
 
-        let disk =
-            VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
-                VZDiskImageStorageDeviceAttachment::alloc(),
-                &file_url(&spec.disk),
-                false,
-                VZDiskImageCachingMode::Automatic,
-                VZDiskImageSynchronizationMode::Full,
-            )
-            .map_err(said)?;
+        let disk: Retained<VZStorageDeviceAttachment> = match &spec.disk {
+            DiskAttachment::File(path) => Retained::into_super(
+                VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+                    VZDiskImageStorageDeviceAttachment::alloc(),
+                    &file_url(path),
+                    false,
+                    VZDiskImageCachingMode::Automatic,
+                    VZDiskImageSynchronizationMode::Full,
+                )
+                .map_err(said)?,
+            ),
+            DiskAttachment::Network(address) => {
+                let url = NSURL::URLWithString(&NSString::from_str(address))
+                    .ok_or_else(|| failed("The address of the machine's disk isn't a URL."))?;
+                Retained::into_super(
+                    VZNetworkBlockDeviceStorageDeviceAttachment::initWithURL_timeout_forcedReadOnly_synchronizationMode_error(
+                        VZNetworkBlockDeviceStorageDeviceAttachment::alloc(),
+                        &url,
+                        DISK_TIMEOUT.as_secs_f64(),
+                        false,
+                        VZDiskSynchronizationMode::Full,
+                    )
+                    .map_err(said)?,
+                )
+            }
+        };
         let mut disks = vec![Retained::into_super(
             VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),

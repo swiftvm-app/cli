@@ -15,8 +15,7 @@ pub(crate) struct Spec {
     pub cpus: u32,
     /// In bytes.
     pub memory: u64,
-    /// The machine's disk, a raw image.
-    pub disk: PathBuf,
+    pub disk: DiskAttachment,
     /// The disc that sets the guest up on its first start.
     pub seed: Option<PathBuf>,
     pub mac_address: String,
@@ -24,6 +23,15 @@ pub(crate) struct Spec {
     pub directory: PathBuf,
     /// The guest's end of its serial console.
     pub console: ConsoleEnd,
+}
+
+/// Where the machine's disk is.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum DiskAttachment {
+    /// A raw image.
+    File(PathBuf),
+    /// A network block device: `nbd+unix:///disk?socket=<path>`.
+    Network(String),
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
