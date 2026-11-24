@@ -6,6 +6,7 @@
 
 mod client;
 mod console;
+mod desktop;
 mod download;
 mod engine;
 mod guest;
@@ -13,16 +14,21 @@ mod host;
 mod images;
 mod import;
 mod iso;
+mod keys;
 mod layers;
 mod lock;
 mod paths;
+mod png;
 pub mod process;
 mod qcow2;
+mod rfb;
 mod saved;
+mod screen;
 mod scripts;
 mod seed;
 mod store;
 
+pub use desktop::{Button, Direction, Picture};
 pub use disk::layer::CLUSTER as LAYER_CLUSTER;
 pub use host::{
     CreateOptions, DiskCheck, DiskInfo, ExecOptions, Host, ImageSummary, LayerCheck, LayerInfo, Machine,
@@ -31,7 +37,7 @@ pub use host::{
 pub use paths::{cache_directory, home_directory};
 pub use proto::agent::{Address, Ended, GuestInfo, Setup, SetupState};
 pub use proto::relay::relay;
-pub use proto::{Error, ErrorCode, NAME, Result};
+pub use proto::{Error, ErrorCode, Input, NAME, Result, SCREEN_PORT, ScreenSize};
 pub use saved::ImageKind;
 pub use scripts::built_in as setup_scripts;
 pub use store::{Automatic, Config, DiskConfig, DiskFormat, Snapshot, Store};

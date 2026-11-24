@@ -1,12 +1,13 @@
 //! The other side of a machine's process: starts one, and talks to it.
 
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use proto::{Request, Response, Status};
+use proto::{Input, NAME, Request, Response, ScreenSize, Screenshot, Status};
 
 use crate::lock::Lock;
 use crate::process::{self, PROCESS_FILE, ProcessFile, STOP_TIMEOUT};
@@ -100,8 +101,9 @@ fn not_answering(directory: &Path, why: impl std::fmt::Display) -> Error {
     )
 }
 
-/// Connects to the machine's process and says hello.
-fn connect(directory: &Path) -> Result<UnixStream> {
+/// Connects to the machine's process and says hello. Returns the version of the protocol that
+/// both speak.
+fn connect(directory: &Path) -> Result<(UnixStream, u32)> {
     // A process that has only just started holds the lock a moment before it listens.
     let deadline = Instant::now() + PATIENCE;
     let mut stream = loop {
@@ -121,13 +123,27 @@ fn connect(directory: &Path) -> Result<UnixStream> {
     stream
         .set_read_timeout(Some(PATIENCE))
         .context("set a time limit")?;
-    proto::greet(&mut stream, env!("CARGO_PKG_VERSION"))?;
-    Ok(stream)
+    let version = proto::greet(&mut stream, env!("CARGO_PKG_VERSION"))?;
+    Ok((stream, version))
 }
 
 /// Sends `request` and returns the answer, which it waits for `patience` at most.
 fn ask(directory: &Path, request: &Request, patience: Duration) -> Result<(UnixStream, Option<Status>)> {
-    let mut stream = connect(directory)?;
+    let (stream, response) = ask_for(directory, request, patience)?;
+    Ok((stream, response.status))
+}
+
+/// The same, with the whole answer.
+fn ask_for(directory: &Path, request: &Request, patience: Duration) -> Result<(UnixStream, Response)> {
+    let (mut stream, version) = connect(directory)?;
+    if matches!(request, Request::Screenshot | Request::Input { .. }) && version < SCREEN_PROTOCOL {
+        return Err(Error::new(
+            ErrorCode::Protocol,
+            format!(
+                "The machine was started by an older build of {NAME}, which can't reach its screen. Stop it and start it again."
+            ),
+        ));
+    }
     stream
         .set_read_timeout(Some(patience))
         .context("set a time limit")?;
@@ -136,7 +152,59 @@ fn ask(directory: &Path, request: &Request, patience: Duration) -> Result<(UnixS
         .map_err(|error| not_answering(directory, error))?
         .ok_or_else(|| not_answering(directory, "it hung up"))?;
     stream.set_read_timeout(None).context("set a time limit")?;
-    Ok((stream, response.into_result()?))
+    Ok((stream, response.checked()?))
+}
+
+/// The version of the control protocol that has the screen's requests.
+const SCREEN_PROTOCOL: u32 = 2;
+
+/// How long the screen gets to answer: the first time, the guest's VNC server is connected to
+/// through the agent, which may be replaced by a newer one on the way.
+const SCREEN_PATIENCE: Duration = Duration::from_secs(60);
+
+/// A picture of the guest's screen, as a PNG.
+pub(crate) fn screenshot(directory: &Path) -> Result<(Screenshot, Vec<u8>)> {
+    let (mut stream, response) = ask_for(directory, &Request::Screenshot, SCREEN_PATIENCE)?;
+    let shot = response
+        .screenshot
+        .ok_or_else(|| not_answering(directory, "its answer has no picture"))?;
+    stream
+        .set_read_timeout(Some(PATIENCE))
+        .context("set a time limit")?;
+    let mut png = Vec::new();
+    (&mut stream)
+        .take(shot.size)
+        .read_to_end(&mut png)
+        .map_err(|error| not_answering(directory, error))?;
+    if png.len() as u64 != shot.size {
+        return Err(not_answering(directory, "the picture was cut short"));
+    }
+    Ok((shot, png))
+}
+
+/// Sends events to the guest's keyboard and pointer, and returns the screen's size.
+pub(crate) fn input(directory: &Path, events: Vec<Input>) -> Result<ScreenSize> {
+    let (_, response) = ask_for(directory, &Request::Input { events }, SCREEN_PATIENCE)?;
+    response
+        .screen
+        .ok_or_else(|| not_answering(directory, "its answer says nothing of the screen"))
+}
+
+/// Where the machine's process passes VNC connections on to the guest's screen.
+pub(crate) fn vnc_socket(directory: &Path) -> Result<PathBuf> {
+    if !is_running(directory) {
+        return Err(Error::new(ErrorCode::NotRunning, "The machine isn't running."));
+    }
+    // Asked, so that a process that is only just starting has written its note.
+    status(directory)?;
+    process_file(directory).and_then(|process| process.vnc).ok_or_else(|| {
+        Error::new(
+            ErrorCode::Protocol,
+            format!(
+                "The machine was started by an older build of {NAME}, which doesn't serve its screen. Stop it and start it again."
+            ),
+        )
+    })
 }
 
 /// What the machine's process says about the machine. Whoever holds the machine's lock counts

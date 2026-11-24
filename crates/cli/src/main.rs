@@ -1,9 +1,11 @@
 //! The command: creates, starts and stops machines, and is the process of each one that runs.
 
 mod console;
+mod desktop;
 mod disk;
 mod guest;
 mod image;
+mod mcp;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -77,6 +79,28 @@ fn usage() -> String {
                              Write an image made from a machine to one file.
   image import <file>        Read an image that was exported.
       --name <name>          Its name here. The one it had unless said.
+  vnc <machine>              Where the machine's screen is served to VNC viewers and apps: a
+                             Unix socket, without a password, that only this user can open.
+  screenshot <machine> [<file> | -]
+                             The guest's screen as a PNG, at its full size. Without a file it
+                             goes to the temporary folder, and its path is printed.
+  click <machine> <x> <y>    Click at a pixel of the screen, from its top left corner.
+      --right, --middle      With another button.
+      --double, --count <n>  Click twice, or up to three times.
+  move <machine> <x> <y>     Move the pointer there.
+  drag <machine> <x> <y> <to x> <to y>
+                             Drag from one place to another.
+  scroll <machine> [<x> <y>] up|down|left|right [<notches>]
+                             Turn the wheel, 3 notches unless said, over the middle of the
+                             screen unless said.
+  type <machine> <text>      Type text at the keyboard's focus.
+  key <machine> <key>...     Press keys one after the other: Return, Escape, Tab, F5, ctrl+s,
+                             ctrl+shift+t.
+  open <machine> <what>      Open an application by name, a file or a URL in the guest's desktop.
+  clipboard <machine> [<text>]
+                             Print the guest's clipboard, or put text on it.
+  mcp                        Serve the Model Context Protocol on standard input and output, for
+                             AI agents: `{NAME} help mcp` says how to add it.
   disk info <machine>        The layers of a machine's disk, and what each holds. Takes the path
                              of a .layer file too.
   disk check <machine>       Read every layer of a stopped machine's disk back and check it. Ends
@@ -471,6 +495,11 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             return guest::run(command, words, json);
         }
         "disk" => return disk::run(words, json),
+        "vnc" | "screenshot" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "open"
+        | "clipboard" => {
+            return desktop::run(command, words, json);
+        }
+        "mcp" => return mcp::run(words),
         _ => Err(invalid(format!(
             "{NAME} has no command \"{command}\". `{NAME} help` lists the commands."
         ))),
@@ -497,6 +526,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     match command.as_str() {
+        "help" if words.get(1).map(String::as_str) == Some("mcp") => {
+            println!("{}", mcp::usage());
+            return ExitCode::SUCCESS;
+        }
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             return ExitCode::SUCCESS;

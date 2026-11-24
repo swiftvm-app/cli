@@ -743,11 +743,14 @@ impl Host {
         {
             _ = std::fs::remove_file(process.socket);
         }
-        if let Ok(config) = Config::load(directory)
-            && let Ok(socket) = socket_path(directory, &config.id, "disk")
-            && !socket.starts_with(directory)
-        {
-            _ = std::fs::remove_file(socket);
+        if let Ok(config) = Config::load(directory) {
+            for name in ["disk", "vnc"] {
+                if let Ok(socket) = socket_path(directory, &config.id, name)
+                    && !socket.starts_with(directory)
+                {
+                    _ = std::fs::remove_file(socket);
+                }
+            }
         }
         self.store.remove(directory, stopped)?;
         // The machine is gone either way. What it leaves goes with the next sweep.

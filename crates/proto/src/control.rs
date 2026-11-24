@@ -3,7 +3,7 @@
 //! Each side first sends a [`Hello`]. The client then sends [`Request`]s and reads a [`Response`]
 //! to each. After the answer to [`Request::Console`] the connection carries the console's bytes
 //! both ways instead, and after the answer to [`Request::Connect`] those of a connection to a
-//! port in the guest.
+//! port in the guest. The answer to [`Request::Screenshot`] is followed by the picture's bytes.
 
 use std::io::{self, Read, Write};
 
@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, ErrorCode};
 
 /// The newest version of the protocol that this build speaks.
-pub const PROTOCOL: u32 = 1;
+///
+/// 2 added [`Request::Screenshot`] and [`Request::Input`].
+pub const PROTOCOL: u32 = 2;
 /// The oldest one. A machine keeps the process it was started with, so a newer command has to
 /// talk to an older process, and the other way round after a downgrade.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -47,6 +49,54 @@ pub enum Request {
     Connect {
         port: u32,
     },
+    /// The guest's screen, as a PNG. The answer's [`Response::screenshot`] says how many bytes of
+    /// it follow the answer.
+    Screenshot,
+    /// Presses keys and moves the pointer on the guest's screen, one event after the other. The
+    /// answer says the screen's size.
+    Input {
+        events: Vec<Input>,
+    },
+}
+
+/// One thing done with the guest's keyboard or pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "input", rename_all = "kebab-case")]
+pub enum Input {
+    /// Puts the pointer at a pixel of the screen, from its top left corner, with these buttons
+    /// held: one bit each, as VNC numbers them ([`buttons`]).
+    Pointer { x: u32, y: u32, buttons: u8 },
+    /// Presses or lets go of the key that types an X keysym.
+    Key { keysym: u32, down: bool },
+    /// Waits before the next event.
+    Pause { milliseconds: u32 },
+}
+
+/// The bits of [`Input::Pointer`]'s buttons.
+pub mod buttons {
+    pub const LEFT: u8 = 1;
+    pub const MIDDLE: u8 = 2;
+    pub const RIGHT: u8 = 4;
+    pub const WHEEL_UP: u8 = 8;
+    pub const WHEEL_DOWN: u8 = 16;
+    pub const WHEEL_LEFT: u8 = 32;
+    pub const WHEEL_RIGHT: u8 = 64;
+}
+
+/// The size of the guest's screen, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// What follows the answer to [`Request::Screenshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Screenshot {
+    pub width: u32,
+    pub height: u32,
+    /// How many bytes of PNG follow.
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +122,10 @@ pub struct Response {
     pub error: Option<Error>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<ScreenSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<Screenshot>,
 }
 
 impl Response {
@@ -80,6 +134,8 @@ impl Response {
             ok: true,
             error: None,
             status,
+            screen: None,
+            screenshot: None,
         }
     }
 
@@ -88,13 +144,20 @@ impl Response {
             ok: false,
             error: Some(error),
             status: None,
+            screen: None,
+            screenshot: None,
         }
     }
 
     pub fn into_result(self) -> Result<Option<Status>, Error> {
-        match (self.ok, self.error) {
-            (true, _) => Ok(self.status),
-            (false, Some(error)) => Err(error),
+        self.checked().map(|response| response.status)
+    }
+
+    /// The answer, if it says that the request was done.
+    pub fn checked(self) -> Result<Self, Error> {
+        match (self.ok, &self.error) {
+            (true, _) => Ok(self),
+            (false, Some(error)) => Err(error.clone()),
             (false, None) => Err(Error::new(
                 ErrorCode::Protocol,
                 "The request failed, and nothing said why.",
@@ -218,6 +281,41 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&running).unwrap(),
             r#"{"ok":true,"status":{"state":"running","pid":7}}"#
+        );
+
+        let input = Request::Input {
+            events: vec![
+                Input::Pointer {
+                    x: 1,
+                    y: 2,
+                    buttons: buttons::LEFT,
+                },
+                Input::Key {
+                    keysym: 0xff0d,
+                    down: true,
+                },
+                Input::Pause { milliseconds: 50 },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_string(&input).unwrap(),
+            r#"{"request":"input","events":[{"input":"pointer","x":1,"y":2,"buttons":1},{"input":"key","keysym":65293,"down":true},{"input":"pause","milliseconds":50}]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Screenshot).unwrap(),
+            r#"{"request":"screenshot"}"#
+        );
+        let shot = Response {
+            screenshot: Some(Screenshot {
+                width: 1280,
+                height: 800,
+                size: 9,
+            }),
+            ..Response::done(None)
+        };
+        assert_eq!(
+            serde_json::to_string(&shot).unwrap(),
+            r#"{"ok":true,"screenshot":{"width":1280,"height":800,"size":9}}"#
         );
     }
 

@@ -5,15 +5,23 @@
 
 use std::path::Path;
 
-use proto::{NAME, variable};
+use proto::{NAME, SCREEN_PORT, variable};
 
 use crate::{Context, Error, ErrorCode, Result};
 
 /// The scripts that come with this program, by the names they are picked with.
 const BUILT_IN: &[(&str, &str)] = &[
+    ("xfce", include_str!("../guest/scripts/xfce.sh")),
+    ("gnome", include_str!("../guest/scripts/gnome.sh")),
+    ("kde-plasma", include_str!("../guest/scripts/kde-plasma.sh")),
+    ("cinnamon", include_str!("../guest/scripts/cinnamon.sh")),
     ("docker", include_str!("../guest/scripts/docker.sh")),
+    ("web-server", include_str!("../guest/scripts/web-server.sh")),
     ("updates", include_str!("../guest/scripts/updates.sh")),
 ];
+
+/// What the desktop scripts share, put into each where it says `@DESKTOP@`.
+const DESKTOP: &str = include_str!("../guest/scripts/desktop.sh");
 
 /// The longest a script's name is kept at.
 const LONGEST_NAME: usize = 120;
@@ -28,12 +36,15 @@ pub(crate) struct Script {
 }
 
 /// A file that goes into a guest, with this program's name in it where its text says `@NAME@`,
-/// and the name of the variable that holds the machine's account where it says
-/// `@USER_VARIABLE@`.
+/// the name of the variable that holds the machine's account where it says `@USER_VARIABLE@`,
+/// the port of the desktop's screen where it says `@SCREEN_PORT@`, and what the desktop scripts
+/// share where it says `@DESKTOP@`.
 pub(crate) fn guest_text(template: &str) -> String {
     template
+        .replace("@DESKTOP@", DESKTOP)
         .replace("@NAME@", NAME)
         .replace("@USER_VARIABLE@", &variable("USER"))
+        .replace("@SCREEN_PORT@", &SCREEN_PORT.to_string())
 }
 
 /// `text` as one line of no more than `limit` characters, without control characters.
@@ -112,6 +123,17 @@ mod tests {
         assert!(source.contains(&format!("\"${{{}}}\"", variable("USER"))));
         assert!(!source.contains('@'));
         assert!(Script::find("updates").unwrap().restart);
+        for name in built_in() {
+            let source = String::from_utf8(Script::find(name).unwrap().source).unwrap();
+            // Fedora's groups of packages start with @ too.
+            for placeholder in ["@NAME@", "@USER_VARIABLE@", "@SCREEN_PORT@", "@DESKTOP@"] {
+                assert!(!source.contains(placeholder), "{name} has {placeholder} left");
+            }
+        }
+        let xfce = String::from_utf8(Script::find("xfce").unwrap().source).unwrap();
+        assert!(xfce.contains("desktop_finish xubuntu xfce"));
+        assert!(xfce.contains(&format!("-rfbport {SCREEN_PORT} -localhost")));
+        assert!(xfce.contains(&format!("{NAME}-desktop.service")));
         assert_eq!(
             Script::find("no-such-script").err().unwrap().code,
             ErrorCode::InvalidArgument

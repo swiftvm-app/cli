@@ -9,9 +9,12 @@ mod error;
 pub mod relay;
 
 pub use control::{
-    Hello, LONGEST_LINE, OLDEST_PROTOCOL, PROTOCOL, Request, Response, State, Status, agreed, greet, receive,
-    send, welcome,
+    Hello, Input, LONGEST_LINE, OLDEST_PROTOCOL, PROTOCOL, Request, Response, ScreenSize, Screenshot, State,
+    Status, agreed, buttons, greet, receive, send, welcome,
 };
+
+/// The TCP port in the guest that its desktop's VNC server listens on, on `localhost` only.
+pub const SCREEN_PORT: u16 = 5900;
 pub use error::{Error, ErrorCode, Result};
 
 /// The product's name: `name` under `[workspace.metadata]` in the workspace's `Cargo.toml`, which

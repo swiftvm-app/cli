@@ -3,9 +3,10 @@
 //!
 //! It holds the machine's lock for as long as it lives, which is how everyone else tells that
 //! the machine is running. It runs the engine, keeps the console, and answers on a socket whose
-//! path it writes to `process.json`.
+//! path it writes to `process.json`. A second socket there passes VNC connections on to the
+//! guest's screen.
 
-use std::io::Write;
+use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +25,7 @@ use crate::engine::{self, DiskAttachment, Engine, Spec};
 use crate::lock::Lock;
 use crate::paths::socket_path;
 use crate::saved::{self, ImageKind, SavedImage};
+use crate::screen::{self, Screen};
 use crate::store::{Automatic, Config, DiskFormat, LOCK, Store};
 use crate::{Context, Error, ErrorCode, Result, guest, layers, now};
 
@@ -45,6 +47,10 @@ pub(crate) struct ProcessFile {
     pub pid: u32,
     /// Where it listens.
     pub socket: PathBuf,
+    /// Where it passes VNC connections on to the guest's screen. Not there for a process
+    /// started by a build from before there were screens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnc: Option<PathBuf>,
     /// Seconds since 1970.
     pub started: u64,
 }
@@ -54,6 +60,8 @@ enum Then {
     Console,
     /// A connection to a port in the guest, a stream socket.
     Relay(UnixStream),
+    /// Bytes that follow the answer: a screenshot.
+    Bytes(Vec<u8>),
 }
 
 struct Phase {
@@ -65,6 +73,7 @@ struct Phase {
 struct Service {
     engine: Box<dyn Engine>,
     console: Arc<Console>,
+    screen: Screen,
     shared: Arc<Shared>,
     /// Requests that haven't been answered yet.
     answering: AtomicUsize,
@@ -172,7 +181,11 @@ impl Service {
                     }
                 }
                 Request::Console if self.shared.state() == State::Stopped => stopped(),
-                Request::Connect { .. } if self.shared.state() != State::Running => stopped(),
+                Request::Connect { .. } | Request::Screenshot | Request::Input { .. }
+                    if self.shared.state() != State::Running =>
+                {
+                    stopped()
+                }
                 Request::Console => {
                     then = Some(Then::Console);
                     Response::done(None)
@@ -182,6 +195,29 @@ impl Service {
                         then = Some(Then::Relay(UnixStream::from(guest)));
                         Response::done(None)
                     }
+                    Err(error) => Response::failed(error),
+                },
+                Request::Screenshot => match self.screen.screenshot() {
+                    Ok((size, png)) => {
+                        let response = Response {
+                            screen: Some(size),
+                            screenshot: Some(proto::Screenshot {
+                                width: size.width,
+                                height: size.height,
+                                size: png.len() as u64,
+                            }),
+                            ..Response::done(None)
+                        };
+                        then = Some(Then::Bytes(png));
+                        response
+                    }
+                    Err(error) => Response::failed(error),
+                },
+                Request::Input { events } => match self.screen.input(&events) {
+                    Ok(size) => Response {
+                        screen: Some(size),
+                        ..Response::done(None)
+                    },
                     Err(error) => Response::failed(error),
                 },
             };
@@ -194,7 +230,8 @@ impl Service {
                 // From here on the connection carries the console, or the guest's connection.
                 Some(Then::Console) => return self.console.attach(stream),
                 Some(Then::Relay(guest)) => return proto::relay::relay(stream, guest),
-                None => {}
+                Some(Then::Bytes(bytes)) if stream.write_all(&bytes).is_err() => return,
+                Some(Then::Bytes(_)) | None => {}
             }
         }
     }
@@ -290,7 +327,7 @@ impl Drop for ServedDisk {
 }
 
 /// Writes a line to the machine's log, in one piece: several processes may be writing to it.
-fn log(line: &str) {
+pub(crate) fn log(line: &str) {
     _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
 }
 
@@ -459,20 +496,38 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     })?;
 
     let socket = socket_path(directory, &config.id, "control")?;
-    _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).at("listen on", &socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).at("protect", &socket)?;
+    let vnc = socket_path(directory, &config.id, "vnc")?;
     let forget = || {
         _ = std::fs::remove_file(&socket);
+        _ = std::fs::remove_file(&vnc);
         _ = std::fs::remove_file(&process_file);
     };
+    // What is made of these is taken away again if the rest isn't.
+    let listen = |path: &Path| {
+        _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).at("listen on", path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).at("protect", path)?;
+        Ok::<_, Error>(listener)
+    };
+    let listeners = listen(&socket).and_then(|listener| Ok((listener, listen(&vnc)?)));
     let about = ProcessFile {
         pid: std::process::id(),
         socket: socket.clone(),
+        vnc: Some(vnc.clone()),
         started: now(),
     };
-    std::fs::write(&process_file, serde_json::to_vec(&about).expect("plain data"))
-        .at("write", &process_file)?;
+    let written = listeners.and_then(|listeners| {
+        std::fs::write(&process_file, serde_json::to_vec(&about).expect("plain data"))
+            .at("write", &process_file)?;
+        Ok(listeners)
+    });
+    let (listener, viewers) = match written {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            forget();
+            return Err(error);
+        }
+    };
 
     if let Err(error) = engine.start() {
         forget();
@@ -482,6 +537,7 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     let service = Arc::new(Service {
         engine,
         console,
+        screen: Screen::new(directory),
         shared,
         answering: AtomicUsize::new(0),
     });
@@ -501,6 +557,11 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
                 std::thread::spawn(move || service.answer(stream));
             }
         });
+    }
+
+    {
+        let directory = directory.to_owned();
+        std::thread::spawn(move || screen::serve_viewers(directory, viewers));
     }
 
     // Waits for the setup to finish, and is left to itself: it finds the machine stopped and the
@@ -533,6 +594,7 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     }
 
     service.console.close();
+    service.screen.close();
     // Whoever asked for the stop is still owed an answer.
     let deadline = Instant::now() + Duration::from_secs(2);
     while service.answering.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
