@@ -13,10 +13,13 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
-use objc2_foundation::{NSArray, NSData, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSData, NSDictionary, NSError, NSFileHandle, NSObject, NSObjectProtocol, NSString, NSURL,
+};
 use objc2_virtualization::*;
 
-use super::{DiskAttachment, Engine, Spec, Stopped};
+use super::{DiskAttachment, Engine, SHARES_TAG, Spec, Stopped};
+use crate::store::Share;
 use crate::{Context, Error, ErrorCode, Result};
 
 /// How long the framework gets to start a machine, or to cut its power.
@@ -130,6 +133,34 @@ fn firmware_variables(directory: &Path) -> Result<Retained<VZEFIVariableStore>> 
             VZEFIVariableStoreInitializationOptions(0),
         )
         .map_err(said)
+    }
+}
+
+/// The folders of `shares`, as the one device that holds them all serves them: each a folder of
+/// its own, under its name.
+fn directory_share(shares: &[Share]) -> Retained<VZDirectoryShare> {
+    // Safety: plain calls with objects that live through them.
+    unsafe {
+        let names: Vec<Retained<NSString>> = shares
+            .iter()
+            .map(|share| NSString::from_str(&share.name))
+            .collect();
+        let folders: Vec<Retained<VZSharedDirectory>> = shares
+            .iter()
+            .map(|share| {
+                VZSharedDirectory::initWithURL_readOnly(
+                    VZSharedDirectory::alloc(),
+                    &file_url(&share.path),
+                    share.read_only,
+                )
+            })
+            .collect();
+        let names: Vec<&NSString> = names.iter().map(|name| &**name).collect();
+        let directories = NSDictionary::from_retained_objects(&names, &folders);
+        Retained::into_super(VZMultipleDirectoryShare::initWithDirectories(
+            VZMultipleDirectoryShare::alloc(),
+            &directories,
+        ))
     }
 }
 
@@ -255,6 +286,16 @@ fn configuration(spec: Spec) -> Result<Retained<VZVirtualMachineConfiguration>> 
             VZVirtioSocketDeviceConfiguration::new(),
         )]));
 
+        // Always there, also without shares, so that folders can be shared while the machine
+        // runs: devices can't be added then.
+        let sharing = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &NSString::from_str(SHARES_TAG),
+        );
+        sharing.setShare(Some(&directory_share(&spec.shares)));
+        configuration
+            .setDirectorySharingDevices(&NSArray::from_retained_slice(&[Retained::into_super(sharing)]));
+
         configuration.validateWithError().map_err(said)?;
         Ok(configuration)
     }
@@ -333,6 +374,27 @@ impl Engine for Machine {
                 let handler = RcBlock::new(move |error: *mut NSError| _ = done.send(outcome(error)));
                 machine.stopWithCompletionHandler(&handler);
             }
+        })?
+    }
+
+    fn share(&self, shares: &[Share]) -> Result<()> {
+        let shares = shares.to_vec();
+        self.ask(LIMIT, move |machine, done| {
+            // Safety: on the machine's queue.
+            unsafe {
+                let device = machine
+                    .directorySharingDevices()
+                    .firstObject()
+                    .and_then(|device| device.downcast::<VZVirtioFileSystemDevice>().ok());
+                let Some(device) = device else {
+                    _ = done.send(Err(failed(
+                        "The machine has no device to share folders with. Stop it and start it again.",
+                    )));
+                    return;
+                };
+                device.setShare(Some(&directory_share(&shares)));
+            }
+            _ = done.send(Ok(()));
         })?
     }
 

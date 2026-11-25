@@ -13,7 +13,7 @@ use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use host::{CreateOptions, Error, ErrorCode, Host, Machine, MachineState, NAME, Progress, Result};
+use host::{CreateOptions, Error, ErrorCode, Host, Machine, MachineState, NAME, Progress, Result, ShareInfo};
 use serde_json::json;
 
 /// The version of what `--json` prints, and of `watch`'s lines: docs/api.md. Fields may be added
@@ -40,6 +40,8 @@ fn usage() -> String {
                              path of a script. Can be given more than once.
       --nested               Let the guest run virtual machines of its own. On a Mac with an
                              M3 or later and macOS 15 or later.
+      --share <folder>       Share a folder of this computer, as share does. Can be given more
+                             than once.
   list                       The machines and whether they are running.
   watch                      Say what changes about the machines, until stopped. With --json,
                              a line like list's at first and whenever a machine changes.
@@ -47,6 +49,12 @@ fn usage() -> String {
   stop <machine>             Shut a machine down, and cut its power if that takes too long.
       --timeout <seconds>    How long the guest gets to shut down. 30 unless said.
       --force                Cut the power at once.
+  share <machine> <folder>   Share a folder of this computer with the guest, which reads and
+                             writes it in place at /mnt/shared/<name>. A running machine gets
+                             it at once. Files the guest writes there belong to this user.
+      --name <name>          Its name in the guest. The folder's own unless said.
+      --read-only            The guest can't change what is in it.
+  unshare <machine> <name>   Stop sharing a folder.
   delete <machine>           Delete a machine and its disk.
       --force                Also when it is running.
   console <machine>          Connect this terminal to a machine's serial console.
@@ -388,6 +396,18 @@ impl Meter {
     }
 }
 
+/// A share as people read it: where the guest sees which folder.
+fn share_line(share: &ShareInfo) -> String {
+    let mut line = format!("{} is {}", host::shared_path(&share.name), share.path.display());
+    if share.read_only {
+        line.push_str(", read-only");
+    }
+    if share.problem.is_some() {
+        line.push_str(", which isn't there");
+    }
+    line
+}
+
 fn machine_row(machine: &Machine) -> Vec<String> {
     let state = match machine.state {
         MachineState::Running => "running",
@@ -437,7 +457,9 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
         "create" => {
             let arguments = Arguments::parse(
                 words,
-                &["name", "cpus", "memory", "disk", "user", "password", "script"],
+                &[
+                    "name", "cpus", "memory", "disk", "user", "password", "script", "share",
+                ],
                 &["nested"],
             )?;
             let options = CreateOptions {
@@ -450,6 +472,7 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 password: arguments.value("password"),
                 scripts: arguments.values("script"),
                 nested: arguments.flag("nested"),
+                shares: arguments.values("share").into_iter().map(Into::into).collect(),
             };
             let host = Host::open()?;
             let mut meter = Meter::new(json);
@@ -506,6 +529,36 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 format!("{name} isn't running.")
             });
             Ok(json!({ "machine": machine }))
+        }
+        "share" => {
+            let arguments = Arguments::parse(words, &["name"], &["read-only"])?;
+            let [name, folder] = arguments.positional.as_slice() else {
+                return Err(invalid("Say which machine, and which folder to share with it."));
+            };
+            let share = Host::open()?.share(
+                name,
+                folder.as_ref(),
+                arguments.value("name").as_deref(),
+                arguments.flag("read-only"),
+            )?;
+            say(format!(
+                "{name} shares {} at {}{}.",
+                share.path.display(),
+                host::shared_path(&share.name),
+                if share.read_only { ", read-only" } else { "" }
+            ));
+            Ok(json!({ "share": share }))
+        }
+        "unshare" => {
+            let arguments = Arguments::parse(words, &[], &[])?;
+            let [name, share] = arguments.positional.as_slice() else {
+                return Err(invalid(
+                    "Say which machine, and the name of the folder it shares.",
+                ));
+            };
+            Host::open()?.unshare(name, share)?;
+            say(format!("{name} no longer shares {share}."));
+            Ok(json!({ "unshared": share }))
         }
         "delete" => {
             let arguments = Arguments::parse(words, &[], &["force"])?;

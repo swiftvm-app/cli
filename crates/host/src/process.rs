@@ -26,8 +26,8 @@ use crate::lock::Lock;
 use crate::paths::socket_path;
 use crate::saved::{self, ImageKind, SavedImage};
 use crate::screen::{self, Screen};
-use crate::store::{Automatic, Config, DiskFormat, LOCK, Store};
-use crate::{Context, Error, ErrorCode, Result, guest, layers, now};
+use crate::store::{Automatic, Config, DiskFormat, LOCK, Share, Store};
+use crate::{Context, Error, ErrorCode, Result, guest, layers, now, shares};
 
 /// The first argument that makes the program a machine's process. The second is the machine's
 /// folder. A program that embeds this library passes both on to [`run`].
@@ -72,6 +72,14 @@ struct Phase {
 
 struct Service {
     engine: Box<dyn Engine>,
+    /// The machine's folder.
+    directory: PathBuf,
+    /// The folders that the engine shares. Held while they change, and while the guest is told.
+    shares: Mutex<Vec<Share>>,
+    /// The guest hasn't been told which shared folders to mount since they last changed.
+    unmounted: AtomicBool,
+    /// The guest's mount of the shared folders is from before they last changed.
+    stale: AtomicBool,
     console: Arc<Console>,
     screen: Screen,
     shared: Arc<Shared>,
@@ -146,6 +154,58 @@ impl Service {
         }
     }
 
+    /// Shares the folders that the machine's settings list now, whose folders are there, and has
+    /// the guest mount them. A guest whose agent doesn't answer yet mounts them when it does.
+    fn share(&self) -> Result<()> {
+        let mut shared = self.shares.lock().unwrap();
+        let wanted = shares::available(&Config::load(&self.directory)?.shares);
+        if *shared != wanted {
+            // The guest lets go of what goes before its device does.
+            let kept: Vec<Share> = shared
+                .iter()
+                .filter(|share| wanted.contains(share))
+                .cloned()
+                .collect();
+            if kept.len() < shared.len() {
+                guest::mount(&self.directory, engine::mounts(&kept, false))?;
+            }
+            self.engine.share(&wanted)?;
+            *shared = wanted;
+            self.stale.store(true, Ordering::SeqCst);
+        }
+        let stale = self.stale.load(Ordering::SeqCst);
+        let mounted = guest::mount(&self.directory, engine::mounts(&shared, stale))?;
+        // A guest that is starting, or restarting, is told once its agent answers.
+        self.unmounted.store(!mounted, Ordering::SeqCst);
+        if mounted {
+            self.stale.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Has the guest mount the shared folders whenever it hasn't been told what they are: after
+    /// a start, and after a change that its agent didn't answer to. For as long as the machine runs.
+    fn keep_mounted(&self) {
+        while self.shared.state() == State::Running {
+            if self.unmounted.load(Ordering::SeqCst) {
+                let shared = self.shares.lock().unwrap();
+                let stale = self.stale.load(Ordering::SeqCst);
+                match guest::mount(&self.directory, engine::mounts(&shared, stale)) {
+                    Ok(true) => {
+                        self.unmounted.store(false, Ordering::SeqCst);
+                        self.stale.store(false, Ordering::SeqCst);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.unmounted.store(false, Ordering::SeqCst);
+                        log(&format!("The guest couldn't mount the shared folders: {error}"));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     /// Answers the requests of one connection.
     fn answer(&self, mut stream: UnixStream) {
         if proto::welcome(&mut stream, env!("CARGO_PKG_VERSION")).is_err() {
@@ -181,7 +241,7 @@ impl Service {
                     }
                 }
                 Request::Console if self.shared.state() == State::Stopped => stopped(),
-                Request::Connect { .. } | Request::Screenshot | Request::Input { .. }
+                Request::Connect { .. } | Request::Screenshot | Request::Input { .. } | Request::Shares
                     if self.shared.state() != State::Running =>
                 {
                     stopped()
@@ -211,6 +271,10 @@ impl Service {
                         then = Some(Then::Bytes(png));
                         response
                     }
+                    Err(error) => Response::failed(error),
+                },
+                Request::Shares => match self.share() {
+                    Ok(()) => Response::done(None),
                     Err(error) => Response::failed(error),
                 },
                 Request::Input { events } => match self.screen.input(&events) {
@@ -525,9 +589,12 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
             .attachment(),
         None => DiskAttachment::File(directory.join(&config.disk.file)),
     };
+    // A folder that isn't there is left out, and shared once it is and the shares change.
+    let folders = shares::available(&config.shares);
     let spec = Spec {
         id: config.id.clone(),
         nested: config.nested,
+        shares: folders.clone(),
         cpus: config.cpus,
         memory: config.memory,
         disk,
@@ -581,11 +648,15 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     }
     shared.set(State::Running);
     let service = Arc::new(Service {
+        shares: Mutex::new(folders),
+        directory: directory.to_owned(),
         engine,
         console,
         screen: Screen::new(directory),
         shared,
         answering: AtomicUsize::new(0),
+        unmounted: AtomicBool::new(true),
+        stale: AtomicBool::new(false),
     });
     tell(&Response::done(Some(service.status())));
     *told = true;
@@ -608,6 +679,11 @@ fn serve(directory: &Path, told: &mut bool) -> Result<()> {
     {
         let directory = directory.to_owned();
         std::thread::spawn(move || screen::serve_viewers(directory, viewers));
+    }
+
+    {
+        let service = service.clone();
+        std::thread::spawn(move || service.keep_mounted());
     }
 
     // Waits for the setup to finish, and is left to itself: it finds the machine stopped and the

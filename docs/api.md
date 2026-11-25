@@ -79,7 +79,8 @@ Sizes are in bytes and times in seconds since 1970. A field marked optional may 
 ```json
 {"name": "a", "state": "running", "pid": 4242, "id": "8599c623…", "image": "debian-13", "arch": "arm64",
  "cpus": 2, "memory": 2147483648, "disk_size": 34359738368, "disk_used": 1060864,
- "disk_shared": 471756800, "user": "username", "created": 1795546459, "nested": false}
+ "disk_shared": 471756800, "user": "username", "created": 1795546459, "nested": false,
+ "shares": [{"name": "Projects", "path": "/Users/username/Projects", "read_only": false}]}
 ```
 
 | Field | Meaning |
@@ -92,6 +93,26 @@ Sizes are in bytes and times in seconds since 1970. A field marked optional may 
 | `disk_used` | What the machine's own layer takes up on this computer |
 | `disk_shared` | What the layers under it take up. Other machines share them |
 | `nested` | The guest can run virtual machines of its own |
+| `shares` | The folders of this computer that it shares: [Share](#share) |
+
+### Share
+
+A folder of this computer that a Linux guest reads and writes in place at `/mnt/shared/<name>`.
+
+```json
+{"name": "Projects", "path": "/Users/username/Projects", "read_only": false}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Its folder in the guest's `/mnt/shared`. Up to 36 letters, digits, `.`, `_` and `-`, not starting with `.` |
+| `path` | The folder on this computer, as a full path |
+| `read_only` | The guest can't change what is in it |
+| `problem` | Optional. The folder isn't there, so the guest doesn't get it |
+
+What either side writes, the other reads at once. A file deleted or renamed on this computer may still be found in the guest for a second, which is how long the guest keeps what it has looked up.
+
+Files the guest writes there belong to this computer's user, whichever account in the guest writes them. A machine created since shares existed gives its account this user's ID, so in the guest they belong to its account too.
 
 ### Image
 
@@ -124,11 +145,13 @@ What the agent in a running guest reports:
 |---|---|
 | `version` | `{"name": "svm", "version": "0.1.0", "api": 1}` |
 | `images [--all]` | `{"images": [Image]}` |
-| `create <image> ...` | `{"machine": Machine}`. Reports progress |
+| `create <image> ...` | `{"machine": Machine}`. Reports progress. `--share <folder>`, more than once, shares folders as `share` does |
 | `list` | `{"machines": [Machine]}`, sorted by name |
 | `start <machine>` | `{"machine": Machine}` |
 | `stop <machine>` | `{"machine": Machine}` |
 | `delete <machine>` | `{"deleted": "<machine>"}` |
+| `share <machine> <folder> [--name <name>] [--read-only]` | `{"share": Share}`. Without a name, the share is named after the folder's last part. A running machine gets it at once: the answer comes once the guest has mounted it, or once that has been asked of a guest that is still starting. A machine started by an older build gets it at its next start, and the command fails with `protocol` |
+| `unshare <machine> <name>` | `{"unshared": "<name>"}`. A running machine lets go of it at once, or, if an older build started it, at its next start, and the command fails with `protocol` |
 | `info <machine>` | `{"machine": Machine, "guest": Guest or null, "guest_error": Error or null}`. `guest` is `null` for a machine that isn't running. `guest_error` is set when the agent didn't answer |
 | `wait <machine>` | `{"guest": Guest}`. Reports progress |
 | `exec <machine> -- <command>` | `{"exit": {"status": 0}, "output": "...", "errors": "..."}`. `exit` has `status`, or `signal`, and may have `"timed_out": true` or `error`. Output is collected, then printed: use `ssh` for a stream |
@@ -185,7 +208,7 @@ A chosen `SVM_RUNTIME` is made, for this user alone, if it isn't there. Keep its
 - The program finds itself by its own path, never through `PATH`: machine processes and `ssh`'s proxy run the copy in the app.
 - Each running machine is a process of the same program. Machine processes outlive the app. Replace the program by writing a new file and renaming it over the old one, never by writing into it: running machines keep the file they started from.
 - On macOS the program needs the `com.apple.security.virtualization` entitlement. Re-signing it, for example with a Developer ID, has to keep that entitlement.
-- On Linux, put `passt` next to the program, or rely on the system's. Its version must support `--vhost-user`.
+- On Linux, put `passt` next to the program, or rely on the system's. Its version must support `--vhost-user`. Shared folders need `virtiofsd` the same way: next to the program, or the system's.
 
 ## Changes to this API
 

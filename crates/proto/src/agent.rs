@@ -4,7 +4,7 @@
 //! an [`AgentHello`]. The host then sends a [`Job`] as one line, and the agent answers with an
 //! [`Answer`]. After a yes, what follows depends on the job:
 //!
-//! - [`Job::Info`] and [`Job::SetClock`]: nothing. The answer is all.
+//! - [`Job::Info`], [`Job::SetClock`] and [`Job::Mount`]: nothing. The answer is all.
 //! - [`Job::Freeze`]: nothing, until the host hangs up.
 //! - [`Job::Exec`], [`Job::CopyIn`], [`Job::CopyOut`] and [`Job::Update`]: frames both ways,
 //!   up to the agent's [`Kind::End`]. The host calls a job off by hanging up.
@@ -77,7 +77,31 @@ pub enum Job {
     Freeze {
         seconds: u64,
     },
+    /// Mounts the folders that the host shares, and unmounts the shared folders that aren't
+    /// among them any more. The answer says when they are in place. The agent mounts the same
+    /// again each time it starts, until it is told otherwise.
+    Mount {
+        mounts: Vec<Mount>,
+    },
 }
+
+/// A virtio-fs device of the guest, mounted at a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mount {
+    /// What the device is called.
+    pub tag: String,
+    /// Where it is mounted: [`SHARED`] or a folder in it.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// The device holds other folders than it did: it is mounted anew if it is mounted, which
+    /// forgets what the guest kept of the folders before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh: bool,
+}
+
+/// The folder of the guest that shared folders are mounted in.
+pub const SHARED: &str = "/mnt/shared";
 
 /// A command to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +589,26 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Job::Tunnel { port: 22 }).unwrap(),
             r#"{"job":"tunnel","port":22}"#
+        );
+        let mount = Job::Mount {
+            mounts: vec![
+                Mount {
+                    tag: "src".into(),
+                    path: "/mnt/shared/src".into(),
+                    read_only: true,
+                    fresh: false,
+                },
+                Mount {
+                    tag: "svm".into(),
+                    path: SHARED.into(),
+                    read_only: false,
+                    fresh: true,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_string(&mount).unwrap(),
+            r#"{"job":"mount","mounts":[{"tag":"src","path":"/mnt/shared/src","read_only":true},{"tag":"svm","path":"/mnt/shared","fresh":true}]}"#
         );
         let ended = Ended {
             signal: Some(15),

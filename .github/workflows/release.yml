@@ -202,15 +202,16 @@ jobs:
           sudo apt-get install -y -q musl-tools
           rustup update stable
           rustup target add ${{ matrix.target }}
-      - name: Build, with passt
+      - name: Build, with passt and virtiofsd
         run: |
           scripts/build.sh ${{ matrix.target }}
           test -x "dist/${{ matrix.target }}/passt"
+          test -x "dist/${{ matrix.target }}/virtiofsd"
           "dist/${{ matrix.target }}/$NAME" version
       - name: Package
         run: |
           mkdir -p out
-          tar -czf "out/$NAME-linux-${{ matrix.arch }}.tar.gz" -C "dist/${{ matrix.target }}" "$NAME" passt
+          tar -czf "out/$NAME-linux-${{ matrix.arch }}.tar.gz" -C "dist/${{ matrix.target }}" "$NAME" passt virtiofsd
       - uses: actions/upload-artifact@v4
         with:
           name: program-linux-${{ matrix.arch }}
@@ -299,8 +300,8 @@ jobs:
 
           git clone "https://x-access-token:$TAP_TOKEN@github.com/$TAP.git" tap
           mkdir -p tap/Formula
-          # passt goes next to the program on Linux, where the program looks for it. Both are in
-          # libexec, so that passt doesn't land on PATH.
+          # passt and virtiofsd go next to the program on Linux, where the program looks for
+          # them. All are in libexec, so that they don't land on PATH.
           cat > "tap/Formula/$NAME.rb" <<EOF
           class $class < Formula
             desc "Linux virtual machines for AI agents"
@@ -380,7 +381,7 @@ jobs:
           variable=$(echo "$NAME" | tr a-z- A-Z_)
           curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/install.sh" | env "${variable}_VERSION=$VERSION" sh
           test "$("$HOME/.local/bin/$NAME" version --json | jq -r .version)" = "$VERSION"
-          if [ "$(uname)" = Linux ]; then test -x "$HOME/.local/bin/passt"; fi
+          if [ "$(uname)" = Linux ]; then test -x "$HOME/.local/bin/passt" && test -x "$HOME/.local/bin/virtiofsd"; fi
       # The tap has stable versions alone.
       - if: matrix.with == 'homebrew' && needs.homebrew.result == 'success'
         run: |

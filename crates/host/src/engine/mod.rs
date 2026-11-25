@@ -12,6 +12,9 @@ pub(crate) mod tools;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
+use proto::agent::{Mount, SHARED};
+
+use crate::store::Share;
 use crate::{Error, ErrorCode, Result};
 
 /// What a machine is made of, for an engine to run.
@@ -32,6 +35,8 @@ pub(crate) struct Spec {
     pub console: ConsoleEnd,
     /// Whether the guest can run virtual machines of its own.
     pub nested: bool,
+    /// Folders of this computer that the guest gets, whose folders are there.
+    pub shares: Vec<Share>,
 }
 
 /// Where the machine's disk is.
@@ -70,6 +75,45 @@ pub(crate) trait Engine: Send + Sync {
 
     /// A connection to `port` of the guest's socket device.
     fn connect(&self, port: u32) -> Result<OwnedFd>;
+
+    /// Shares these folders with the running guest, and no others. The guest mounts them as
+    /// [`mounts`] says.
+    fn share(&self, shares: &[Share]) -> Result<()>;
+}
+
+/// The tag of the device that holds all of a machine's shares, each a folder in it, on a Mac.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const SHARES_TAG: &str = proto::NAME;
+
+/// What the guest mounts to see `shares` in [`SHARED`], after they `changed` or not. On a Mac
+/// one device holds them all, and whatever it held before is forgotten when they change.
+/// cloud-hypervisor has a device for each, tagged with its name, which stays as it is.
+pub(crate) fn mounts(shares: &[Share], changed: bool) -> Vec<Mount> {
+    if cfg!(target_os = "macos") {
+        if shares.is_empty() {
+            return Vec::new();
+        }
+        return vec![Mount {
+            tag: SHARES_TAG.into(),
+            path: SHARED.into(),
+            read_only: false,
+            fresh: changed,
+        }];
+    }
+    shares
+        .iter()
+        .map(|share| Mount {
+            tag: share.name.clone(),
+            path: crate::shares::guest_path(&share.name),
+            read_only: share.read_only,
+            fresh: false,
+        })
+        .collect()
+}
+
+/// The name of the socket that serves the share called `name`, on Linux.
+pub(crate) fn share_socket_name(name: &str) -> String {
+    format!("fs-{name}")
 }
 
 #[cfg(target_os = "macos")]

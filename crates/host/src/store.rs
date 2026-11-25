@@ -8,11 +8,12 @@
 //!     disk.layer  seed.iso      its disk, and what sets it up on its first start
 //!     lock                      held by its process for as long as it runs
 //!     config.lock               held while config.json is changed
+//!     agent-update.lock         held while the guest's agent is replaced
 //!     process.json              that process and its socket
 //!     console.log  machine.log  what the guest printed, and what its process had to say
 //!     network.log               what passt had to say, on Linux
 //!     *.sock                    the sockets of its process: control and vnc; disk; on Linux api,
-//!                               vsock and network
+//!                               vsock, network, and fs-<share> for each shared folder
 //! ```
 //!
 //! A machine that is being created is put together in a folder that isn't a machine yet, and
@@ -62,6 +63,19 @@ pub struct Config {
     /// Whether the guest can run virtual machines of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nested: bool,
+    /// Folders of this computer that the guest sees in `/mnt/shared`. Names are unique.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Share>,
+}
+
+/// A folder of this computer that the guest sees in `/mnt/shared/<name>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    pub name: String,
+    /// The folder, as a full path.
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

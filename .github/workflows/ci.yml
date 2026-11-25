@@ -68,7 +68,7 @@ jobs:
           rustup update stable
           rustup target add ${{ matrix.target }}
       # Ubuntu 24.04's passt is too old for vhost-user, so this also checks the bundled one.
-      - name: Install, with passt next to the program
+      - name: Install, with passt and virtiofsd next to the program
         run: scripts/install.sh "$RUNNER_TEMP/bin"
       - name: Create, start, use and delete a machine
         if: steps.kvm.outputs.present == 'yes'
@@ -76,14 +76,26 @@ jobs:
           set -x
           program=$RUNNER_TEMP/bin/$NAME
           test -x "$RUNNER_TEMP/bin/passt"
+          test -x "$RUNNER_TEMP/bin/virtiofsd"
           test "$("$program" version --json | jq .api)" = 1
-          "$program" create debian-13 --name a --cpus 2 --memory 2G --user runner --password password
+          mkdir work && echo from-host > work/host.txt
+          "$program" create debian-13 --name a --cpus 2 --memory 2G --user runner --password password --share "$PWD/work"
           "$program" start a
           "$program" wait a --timeout 600
           "$program" exec a -- sh -c 'uname -a; curl -sSfI https://example.com | head -1'
           echo hello > hello.txt
           "$program" cp hello.txt a:hello.txt
           test "$("$program" exec a -- cat hello.txt)" = hello
+          test "$("$program" exec a -- cat /mnt/shared/work/host.txt)" = from-host
+          "$program" exec a -- sh -c 'echo from-guest > /mnt/shared/work/guest.txt'
+          test "$(cat work/guest.txt)" = from-guest
+          test "$(stat -c %u work/guest.txt)" = "$(id -u)"
+          "$program" share a "$PWD/work" --name ro --read-only
+          sleep 2
+          test "$("$program" exec a -- cat /mnt/shared/ro/host.txt)" = from-host
+          ! "$program" exec a -- touch /mnt/shared/ro/denied
+          "$program" unshare a ro
+          ! "$program" exec a -- test -e /mnt/shared/ro
           "$program" snapshot a one
           "$program" wait a --timeout 600
           "$program" stop a

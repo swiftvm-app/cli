@@ -5,6 +5,7 @@
 # On a Mac the program is signed with the virtualization entitlement (scripts/build.sh). On Linux
 # it is the static program for this processor, with passt next to it: that takes the processor's
 # musl target (`rustup target add`), musl-tools for zstd, and what scripts/build-passt.sh needs.
+# virtiofsd goes next to it too where Docker is there (scripts/build-virtiofsd.sh).
 #
 # It is put in place under a new name and then renamed: a machine that is running is a process of
 # the program that was there before, and keeps it.
@@ -34,7 +35,7 @@ esac
 
 mkdir -p "$folder"
 folder=$(cd "$folder" && pwd)
-for file in "$name" passt; do
+for file in "$name" passt virtiofsd; do
     [ -f "$built/$file" ] || continue
     # cp keeps a Mac program's signature, which is part of the file.
     cp "$built/$file" "$folder/.$file.new"

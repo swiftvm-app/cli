@@ -161,3 +161,86 @@ fn progress_is_an_object_named_by_its_step() {
         assert_eq!(serde_json::to_value(progress).unwrap(), expected);
     }
 }
+
+#[test]
+fn folders_are_shared_and_unshared() {
+    let folder = folder("share");
+    // A stopped machine, as far as its settings go: sharing needs nothing else.
+    let machine = folder.join("home/machines/m");
+    std::fs::create_dir_all(&machine).unwrap();
+    host::Config {
+        version: 2,
+        id: "0".repeat(32),
+        name: "m".into(),
+        image: "debian-13".into(),
+        arch: "arm64".into(),
+        cpus: 1,
+        memory: 1 << 30,
+        disk: host::DiskConfig {
+            file: "disk.layer".into(),
+            format: host::DiskFormat::Layer,
+            size: 1 << 30,
+        },
+        mac_address: "02:00:00:00:00:01".into(),
+        user: "username".into(),
+        created: 0,
+        snapshots: Vec::new(),
+        automatic: None,
+        nested: false,
+        shares: Vec::new(),
+    }
+    .save(&machine)
+    .unwrap();
+    let projects = folder.join("My Projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let projects = projects.canonicalize().unwrap();
+    let json = |words: &[&str]| {
+        let output = command(&folder, words).output().unwrap();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), value)
+    };
+    let path = projects.to_str().unwrap();
+
+    let (status, value) = json(&["share", "m", path, "--read-only", "--json"]);
+    assert_eq!(status, Some(0), "{value}");
+    assert_eq!(
+        value,
+        json!({ "share": { "name": "My-Projects", "path": path, "read_only": true } })
+    );
+    let (status, value) = json(&["share", "m", path, "--json"]);
+    assert_eq!(
+        (status, &value["error"]["code"]),
+        (Some(1), &json!("already-exists"))
+    );
+    let (status, _) = json(&["share", "m", path, "--name", "src", "--json"]);
+    assert_eq!(status, Some(0));
+    let (status, value) = json(&["share", "m", path, "--name", "a/b", "--json"]);
+    assert_eq!(
+        (status, &value["error"]["code"]),
+        (Some(2), &json!("invalid-argument"))
+    );
+    let (status, value) = json(&["share", "m", "/nonexistent-folder", "--json"]);
+    assert_eq!((status, &value["error"]["code"]), (Some(1), &json!("not-found")));
+    let (status, value) = json(&["share", "nothing", path, "--json"]);
+    assert_eq!((status, &value["error"]["code"]), (Some(1), &json!("not-found")));
+
+    let (_, value) = json(&["list", "--json"]);
+    assert_eq!(
+        value["machines"][0]["shares"],
+        json!([
+            { "name": "My-Projects", "path": path, "read_only": true },
+            { "name": "src", "path": path, "read_only": false },
+        ])
+    );
+    std::fs::remove_dir_all(&projects).unwrap();
+    let (_, value) = json(&["list", "--json"]);
+    assert!(value["machines"][0]["shares"][1]["problem"].is_string());
+
+    let (status, value) = json(&["unshare", "m", "src", "--json"]);
+    assert_eq!((status, value), (Some(0), json!({ "unshared": "src" })));
+    let (status, value) = json(&["unshare", "m", "src", "--json"]);
+    assert_eq!((status, &value["error"]["code"]), (Some(1), &json!("not-found")));
+    let (_, value) = json(&["list", "--json"]);
+    assert_eq!(value["machines"][0]["shares"].as_array().unwrap().len(), 1);
+    _ = std::fs::remove_dir_all(&folder);
+}
