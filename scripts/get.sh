@@ -80,8 +80,9 @@ main() {
 
     mkdir -p "$folder"
     folder=$(cd "$folder" && pwd)
-    # passt, the network of machines on Linux, goes next to the program, where it looks for it.
-    for file in "$name" passt; do
+    # passt, the network of machines on Linux, and virtiofsd, which serves their shared folders,
+    # go next to the program, where it looks for them.
+    for file in "$name" passt virtiofsd; do
         [ -f "$work/files/$file" ] || continue
         cp "$work/files/$file" "$folder/.$file.new"
         chmod 755 "$folder/.$file.new"

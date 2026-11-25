@@ -19,6 +19,7 @@ use crate::process::SEED_FILE;
 use crate::saved::{self, ImageKind, SavedImage};
 use crate::scripts::Script;
 use crate::seed::{self, Seed};
+use crate::shares::{self, ShareInfo};
 use crate::store::{self, Automatic, Config, DiskConfig, DiskFormat, LOCK, Snapshot, Store};
 use crate::{
     AGENT, Context, Error, ErrorCode, NAME, Result, client, download, guest, layers, now, random_hex,
@@ -68,6 +69,9 @@ pub struct CreateOptions {
     pub scripts: Vec<String>,
     /// Lets the guest run virtual machines of its own. Not every computer can.
     pub nested: bool,
+    /// Folders of this computer that the guest sees in `/mnt/shared`, each under its last part's
+    /// name.
+    pub shares: Vec<PathBuf>,
 }
 
 /// A command to run in a guest.
@@ -144,6 +148,8 @@ pub struct Machine {
     pub created: u64,
     /// Whether the guest can run virtual machines of its own.
     pub nested: bool,
+    /// The folders of this computer that the guest sees in `/mnt/shared`.
+    pub shares: Vec<ShareInfo>,
 }
 
 /// An image that machines can be created from.
@@ -325,6 +331,7 @@ fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
         user: String::new(),
         created: 0,
         nested: false,
+        shares: Vec::new(),
     };
     match Config::load(directory) {
         Ok(config) => {
@@ -343,6 +350,7 @@ fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
             machine.user = config.user;
             machine.created = config.created;
             machine.nested = config.nested;
+            machine.shares = config.shares.iter().map(ShareInfo::of).collect();
         }
         Err(error) if !running => {
             machine.state = MachineState::Broken;
@@ -351,6 +359,24 @@ fn summary(store: &Store, directory: &Path, name: &str) -> Machine {
         Err(error) => machine.problem = Some(error.message),
     }
     machine
+}
+
+/// Why a change to what a running machine shares waits for its next start.
+fn started_by_older_build(name: &str) -> Error {
+    Error::new(
+        ErrorCode::Protocol,
+        format!(
+            "\"{name}\" was started by an older build of {NAME}, which can't change what it shares while it runs. The change takes effect when it is started again."
+        ),
+    )
+}
+
+/// The ID that the account of a new machine gets: this user's, so that the files that the guest
+/// writes in shared folders are the account's in the guest too. Not root's.
+fn account_id() -> Option<u32> {
+    // Safety: getuid can't fail.
+    let uid = unsafe { libc::getuid() };
+    (uid != 0).then_some(uid)
 }
 
 /// The address of a network card that no manufacturer has given out.
@@ -467,6 +493,14 @@ impl Host {
             if self.store.directory(name).exists() {
                 return Err(store::already_exists(name));
             }
+        }
+        let mut shares = Vec::new();
+        for folder in &options.shares {
+            shares::add(
+                &mut shares,
+                shares::new(folder, None, false)?,
+                options.name.as_deref().unwrap_or(&options.image),
+            )?;
         }
         let scripts = options
             .scripts
@@ -625,6 +659,7 @@ impl Host {
             snapshots: Vec::new(),
             automatic,
             nested: options.nested,
+            shares,
         };
 
         // A machine without a name is called after its image: debian-13, debian-13-2 and so on.
@@ -652,6 +687,7 @@ impl Host {
                 password: options.password.as_deref(),
                 mac_address: &config.mac_address,
                 agent: AGENT,
+                uid: account_id(),
                 // A system that has run before has run its scripts.
                 scripts: if copy { &[] } else { &scripts },
             };
@@ -766,14 +802,22 @@ impl Host {
             _ = std::fs::remove_file(process.socket);
         }
         if let Ok(config) = Config::load(directory) {
-            for name in ["disk", "vnc", "api", "vsock", "network"] {
-                if let Ok(socket) = socket_path(directory, &config.id, name)
+            let shared = config
+                .shares
+                .iter()
+                .map(|share| engine::share_socket_name(&share.name));
+            let names = ["disk", "vnc", "api", "vsock", "network"].map(String::from);
+            for name in names.into_iter().chain(shared) {
+                if let Ok(socket) = socket_path(directory, &config.id, &name)
                     && !socket.starts_with(directory)
                 {
-                    // passt makes one more next to its own.
-                    let mut repair = socket.as_os_str().to_owned();
-                    repair.push(".repair");
-                    _ = std::fs::remove_file(repair);
+                    // passt makes one more next to its own, and virtiofsd one that holds its
+                    // process ID.
+                    for suffix in [".repair", ".pid"] {
+                        let mut beside = socket.as_os_str().to_owned();
+                        beside.push(suffix);
+                        _ = std::fs::remove_file(beside);
+                    }
                     _ = std::fs::remove_file(socket);
                 }
             }
@@ -782,6 +826,68 @@ impl Host {
         // The machine is gone either way. What it leaves goes with the next sweep.
         _ = layers::sweep(&self.store);
         Ok(())
+    }
+
+    /// Shares the folder at `folder` with the machine, as `/mnt/shared/<name>` in the guest: as
+    /// `share_name`, or under the folder's last part. A running machine gets it at once.
+    pub fn share(
+        &self,
+        name: &str,
+        folder: &Path,
+        share_name: Option<&str>,
+        read_only: bool,
+    ) -> Result<ShareInfo> {
+        let directory = self.store.find(name)?;
+        let share = shares::new(folder, share_name, read_only)?;
+        Config::update(&directory, |config| {
+            shares::add(&mut config.shares, share.clone(), name)
+        })?;
+        match self.apply_shares(&directory) {
+            Ok(true) => Ok(ShareInfo::of(&share)),
+            // Its process can't take it while it runs: it is shared from the next start.
+            Ok(false) => Err(started_by_older_build(name)),
+            // A machine that can't take it doesn't keep it.
+            Err(error) => {
+                _ = Config::update(&directory, |config| {
+                    config.shares.retain(|taken| taken.name != share.name);
+                    Ok(())
+                });
+                _ = self.apply_shares(&directory);
+                Err(error)
+            }
+        }
+    }
+
+    /// Stops sharing the folder that the machine has as `share_name`. A running machine lets
+    /// go of it at once.
+    pub fn unshare(&self, name: &str, share_name: &str) -> Result<()> {
+        let directory = self.store.find(name)?;
+        Config::update(&directory, |config| {
+            if !config.shares.iter().any(|share| share.name == share_name) {
+                return Err(Error::new(
+                    ErrorCode::NotFound,
+                    format!("\"{name}\" shares no folder called \"{share_name}\"."),
+                ));
+            }
+            config.shares.retain(|share| share.name != share_name);
+            Ok(())
+        })?;
+        if !self.apply_shares(&directory)? {
+            return Err(started_by_older_build(name));
+        }
+        Ok(())
+    }
+
+    /// Has the machine's process share what the machine's settings say, if it runs. One that
+    /// starts meanwhile reads the settings itself. `false` when its process is too old to.
+    fn apply_shares(&self, directory: &Path) -> Result<bool> {
+        if !client::is_running(directory) {
+            return Ok(true);
+        }
+        match client::shares(directory) {
+            Err(error) if error.code == ErrorCode::NotRunning => Ok(true),
+            other => other,
+        }
     }
 
     /// Shuts the machine down if it runs, and holds its lock so that it doesn't start until the
@@ -1558,6 +1664,7 @@ mod tests {
             snapshots: Vec::new(),
             automatic: None,
             nested: false,
+            shares: Vec::new(),
         }
         .save(&staged.directory)
         .unwrap();

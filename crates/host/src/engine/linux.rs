@@ -6,7 +6,12 @@
 //! cloud-hypervisor's standard input and output. cloud-hypervisor is told what to do over its
 //! API socket, a little HTTP, and passes connections to ports of the guest's socket device on
 //! from a Unix socket: `CONNECT <port>`, answered `OK <port>`.
+//!
+//! Each shared folder has a virtiofsd process of its own, which serves a virtio-fs device tagged
+//! with the share's name. Like passt, it serves one connection and is started again when it ends
+//! while the machine runs.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -16,14 +21,17 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{DiskAttachment, Engine, Spec, Stopped, tools};
+use super::{DiskAttachment, Engine, Spec, Stopped, share_socket_name, tools};
 use crate::paths::socket_path;
+use crate::store::Share;
 use crate::{Context, Error, ErrorCode, Result};
 
 /// How long cloud-hypervisor gets to start a machine, or to answer a request.
 const LIMIT: Duration = Duration::from_secs(60);
-/// How long passt gets to start listening.
+/// How long passt, or virtiofsd, gets to start listening.
 const PASST_LIMIT: Duration = Duration::from_secs(10);
+/// How often a virtiofsd that couldn't be started again is tried.
+const RETRY: Duration = Duration::from_secs(5);
 /// How long a port of the guest gets to answer.
 const CONNECT_LIMIT: Duration = Duration::from_secs(5);
 /// The guest's address on its socket device. The host's is 2.
@@ -45,6 +53,9 @@ pub(crate) struct Machine {
 }
 
 struct Inner {
+    /// The machine's folder and ID, which name the sockets of its shares.
+    directory: PathBuf,
+    id: String,
     api: PathBuf,
     vsock: PathBuf,
     network: PathBuf,
@@ -71,6 +82,41 @@ struct Processes {
     cut: bool,
     /// cloud-hypervisor has ended.
     ended: bool,
+    /// The shared folders, by name.
+    shares: BTreeMap<String, Served>,
+}
+
+/// A shared folder, and the virtiofsd that serves it.
+struct Served {
+    share: Share,
+    socket: PathBuf,
+    /// While it runs.
+    server: Option<Child>,
+}
+
+impl Processes {
+    /// The machine has stopped, or is stopping, and nothing is to be started for it.
+    fn over(&self) -> bool {
+        self.cut || self.ended || (self.started && self.hypervisor.is_none())
+    }
+}
+
+/// What cloud-hypervisor calls the device of the share called `name`.
+fn device_id(name: &str) -> String {
+    share_socket_name(name)
+}
+
+/// virtiofsd's socket, and the file next to it that holds its process ID.
+fn remove_share_sockets(socket: &Path) {
+    let mut pid = socket.as_os_str().to_owned();
+    pid.push(".pid");
+    _ = std::fs::remove_file(socket);
+    _ = std::fs::remove_file(pid);
+}
+
+fn end(mut child: Child) {
+    _ = child.kill();
+    _ = child.wait();
 }
 
 /// Has the child end when this process does, whatever ends it.
@@ -85,6 +131,31 @@ fn end_with_parent(command: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Starts `command` from a thread that lasts as long as the child does: one that [`end_with_parent`]
+/// set up gets its signal when the thread that started it ends.
+fn spawn_lasting(mut command: Command) -> std::io::Result<Child> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let child = command.spawn();
+        let pid = child.as_ref().ok().map(Child::id);
+        _ = sender.send(child);
+        if let Some(pid) = pid {
+            // Waited for without taking it away: whoever holds the child does that.
+            // Safety: a plain call with a buffer that lives through it.
+            unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                while libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) == -1
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                }
+            }
+        }
+    });
+    receiver
+        .recv()
+        .unwrap_or_else(|_| Err(std::io::Error::other("the thread that starts it ended")))
 }
 
 /// Says what is wrong if this user can't use KVM.
@@ -110,7 +181,7 @@ impl Machine {
         }
         check_kvm()?;
         let tools = tools::find(&crate::cache_directory()?)?;
-        let socket = |name| socket_path(&spec.directory, &spec.id, name);
+        let socket = |name: &str| socket_path(&spec.directory, &spec.id, name);
         let api = socket("api")?;
         let vsock = socket("vsock")?;
         let network = socket("network")?;
@@ -143,6 +214,28 @@ impl Machine {
         if let Some(seed) = &spec.seed {
             disks.push(format!("path={},readonly=on,image_type=raw", seed.display()));
         }
+        let mut shares = BTreeMap::new();
+        for share in &spec.shares {
+            let socket = socket(&share_socket_name(&share.name))?;
+            shares.insert(
+                share.name.clone(),
+                Served {
+                    share: share.clone(),
+                    socket,
+                    server: None,
+                },
+            );
+        }
+        if !shares.is_empty() {
+            command.arg("--fs").args(shares.values().map(|served| {
+                format!(
+                    "tag={},socket={},id={}",
+                    served.share.name,
+                    served.socket.display(),
+                    device_id(&served.share.name)
+                )
+            }));
+        }
         command
             .arg("--disk")
             .args(disks)
@@ -164,6 +257,8 @@ impl Machine {
 
         Ok(Self {
             inner: Arc::new(Inner {
+                directory: spec.directory.clone(),
+                id: spec.id.clone(),
                 api,
                 vsock,
                 network,
@@ -171,7 +266,10 @@ impl Machine {
                 network_log: spec.directory.join("network.log"),
                 passt_said: Arc::new(Mutex::new(Vec::new())),
                 stopped,
-                state: Mutex::new(Processes::default()),
+                state: Mutex::new(Processes {
+                    shares,
+                    ..Processes::default()
+                }),
                 changed: Condvar::new(),
                 said: Arc::new(Mutex::new(Vec::new())),
             }),
@@ -223,48 +321,171 @@ impl Machine {
         Ok(passt)
     }
 
-    /// Starts passt, and starts it again each time it ends while the machine runs: it serves
-    /// one connection, and cloud-hypervisor connects again when the guest restarts.
+    /// Starts virtiofsd for `share` on `socket`, and returns once it listens.
+    fn start_virtiofsd(share: &Share, socket: &Path) -> Result<Child> {
+        let program = tools::virtiofsd()?;
+        remove_share_sockets(socket);
+        // Safety: neither can fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut command = Command::new(&program);
+        command
+            .arg(format!("--socket-path={}", socket.display()))
+            .arg("--shared-dir")
+            .arg(&share.path)
+            // As this user, who can't make the namespaces of a sandbox. The guest is the
+            // user's own, and reaches nothing that the user can't.
+            .args(["--sandbox=none", "--cache=auto", "--log-level=error"])
+            // Files that anyone in the guest writes are this user's, which is all that a
+            // virtiofsd of this user can write anyway.
+            .arg(format!("--translate-uid=squash-guest:0:{uid}:4294967295"))
+            .arg(format!("--translate-gid=squash-guest:0:{gid}:4294967295"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if share.read_only {
+            command.arg("--readonly");
+        }
+        end_with_parent(&mut command);
+        // Shares are added from the thread of a request, which ends soon after.
+        let mut server = spawn_lasting(command).at("start", &program)?;
+        let said = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = server.stderr.take() {
+            let kept = said.clone();
+            std::thread::spawn(move || keep_end(stderr, kept, true));
+        }
+        let deadline = Instant::now() + PASST_LIMIT;
+        while !socket.exists() {
+            if let Ok(Some(status)) = server.try_wait() {
+                std::thread::sleep(Duration::from_millis(50));
+                return Err(failed(match last_line(&said.lock().unwrap()) {
+                    Some(line) => format!("virtiofsd ended at once ({status}): {line}"),
+                    None => format!("virtiofsd ended at once ({status})."),
+                }));
+            }
+            if Instant::now() > deadline {
+                end(server);
+                return Err(failed("virtiofsd didn't start listening in time."));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(server)
+    }
+
+    /// Starts virtiofsd for each share that has none running. Says what failed, after trying
+    /// them all.
+    fn start_shares(inner: &Inner) -> Result<()> {
+        let missing: Vec<(String, Share, PathBuf)> = {
+            let state = inner.state.lock().unwrap();
+            state
+                .shares
+                .iter()
+                .filter(|(_, served)| served.server.is_none())
+                .map(|(name, served)| (name.clone(), served.share.clone(), served.socket.clone()))
+                .collect()
+        };
+        let mut failure = None;
+        for (name, share, socket) in missing {
+            let server = match Self::start_virtiofsd(&share, &socket) {
+                Ok(server) => server,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            // A share that was taken away or shared anew in the meantime has what it needs.
+            match inner.state.lock().unwrap().shares.get_mut(&name) {
+                Some(served) if served.server.is_none() => served.server = Some(server),
+                _ => end(server),
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Ends every virtiofsd.
+    fn end_shares(inner: &Inner) {
+        let servers: Vec<(Option<Child>, PathBuf)> = {
+            let mut state = inner.state.lock().unwrap();
+            state
+                .shares
+                .values_mut()
+                .map(|served| (served.server.take(), served.socket.clone()))
+                .collect()
+        };
+        for (server, socket) in servers {
+            if let Some(server) = server {
+                end(server);
+            }
+            remove_share_sockets(&socket);
+        }
+    }
+
+    /// Starts passt, and starts it and virtiofsd again each time they end while the machine
+    /// runs: each serves one connection, and cloud-hypervisor connects again when the guest
+    /// restarts.
     fn start_network(&self) -> Result<()> {
         let passt = Self::start_passt(&self.inner)?;
         self.inner.state.lock().unwrap().passt = Some(passt);
         let inner = self.inner.clone();
-        // passt ends with the thread that started it, so this one lasts as long as the machine.
+        // The programs end with the thread that started them, so this one lasts as long as the
+        // machine.
         std::thread::spawn(move || {
-            let over =
-                |state: &Processes| state.cut || state.ended || (state.started && state.hypervisor.is_none());
+            let mut retried = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
-                {
+                let (passt_ended, server_ended) = {
                     let mut state = inner.state.lock().unwrap();
-                    if over(&state) {
+                    if state.over() {
                         return;
                     }
-                    match state.passt.as_mut().map(Child::try_wait) {
-                        Some(Ok(None)) => continue,
+                    let passt_ended = match state.passt.as_mut().map(Child::try_wait) {
+                        Some(Ok(None)) => false,
                         None => return,
-                        Some(_) => {}
-                    }
-                    if let Some(mut ended) = state.passt.take() {
+                        Some(_) => true,
+                    };
+                    if passt_ended && let Some(mut ended) = state.passt.take() {
                         _ = ended.wait();
                     }
-                }
-                let passt = match Self::start_passt(&inner) {
-                    Ok(passt) => passt,
-                    Err(error) => {
-                        crate::process::log(&format!("Couldn't start passt again: {error}"));
+                    // One that couldn't be started is tried again now and then.
+                    let mut server_ended = retried.elapsed() > RETRY
+                        && state.shares.values().any(|served| served.server.is_none());
+                    for served in state.shares.values_mut() {
+                        if let Some(server) = &mut served.server
+                            && !matches!(server.try_wait(), Ok(None))
+                        {
+                            _ = server.wait();
+                            served.server = None;
+                            server_ended = true;
+                        }
+                    }
+                    (passt_ended, server_ended)
+                };
+                if passt_ended {
+                    let passt = match Self::start_passt(&inner) {
+                        Ok(passt) => passt,
+                        Err(error) => {
+                            crate::process::log(&format!("Couldn't start passt again: {error}"));
+                            return;
+                        }
+                    };
+                    let mut state = inner.state.lock().unwrap();
+                    if state.over() {
+                        drop(state);
+                        end(passt);
                         return;
                     }
-                };
-                let mut state = inner.state.lock().unwrap();
-                if over(&state) {
-                    drop(state);
-                    let mut passt = passt;
-                    _ = passt.kill();
-                    _ = passt.wait();
-                    return;
+                    state.passt = Some(passt);
                 }
-                state.passt = Some(passt);
+                if server_ended {
+                    retried = Instant::now();
+                    // One that was shared again in the meantime has a server of its own already.
+                    if let Err(error) = Self::start_shares(&inner) {
+                        crate::process::log(&format!("Couldn't start virtiofsd again: {error}"));
+                    }
+                    if inner.state.lock().unwrap().over() {
+                        Self::end_shares(&inner);
+                        return;
+                    }
+                }
             }
         });
         Ok(())
@@ -299,6 +520,7 @@ impl Machine {
         };
         let status = hypervisor.wait();
         Self::end_network(&inner);
+        Self::end_shares(&inner);
         _ = std::fs::remove_file(&inner.api);
         _ = std::fs::remove_file(&inner.vsock);
         let failure = match status {
@@ -333,7 +555,7 @@ impl Machine {
                     }
                 }));
             }
-            if let Ok((200, body)) = api(&self.inner.api, "GET", "vm.info")
+            if let Ok((200, body)) = api(&self.inner.api, "GET", "vm.info", None)
                 && body.contains("\"Running\"")
             {
                 return Ok(());
@@ -388,14 +610,27 @@ fn keep_end(mut from: impl Read, kept: Arc<Mutex<Vec<u8>>>, pass_on: bool) {
     }
 }
 
-/// Asks cloud-hypervisor's API for `/api/v1/<what>`. Returns the status and the body.
-fn api(socket: &Path, method: &str, what: &str) -> std::io::Result<(u16, String)> {
+/// Asks cloud-hypervisor's API for `/api/v1/<what>`, with a JSON body if there is one. Returns
+/// the status and the body of the answer.
+fn api(
+    socket: &Path,
+    method: &str,
+    what: &str,
+    body: Option<&serde_json::Value>,
+) -> std::io::Result<(u16, String)> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(LIMIT))?;
     stream.set_write_timeout(Some(LIMIT))?;
+    let body = body.map(serde_json::Value::to_string).unwrap_or_default();
+    let kind = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
     stream.write_all(
         format!(
-            "{method} /api/v1/{what} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Length: 0\r\n\r\n"
+            "{method} /api/v1/{what} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n{kind}Content-Length: {}\r\n\r\n{body}",
+            body.len()
         )
         .as_bytes(),
     )?;
@@ -440,11 +675,19 @@ impl Engine for Machine {
         };
         _ = std::fs::remove_file(&self.inner.api);
         _ = std::fs::remove_file(&self.inner.vsock);
-        self.start_network()?;
+        if let Err(error) = Self::start_shares(&self.inner) {
+            Self::end_shares(&self.inner);
+            return Err(error);
+        }
+        if let Err(error) = self.start_network() {
+            Self::end_shares(&self.inner);
+            return Err(error);
+        }
         let mut hypervisor = match command.spawn() {
             Ok(hypervisor) => hypervisor,
             Err(error) => {
                 Self::end_network(&self.inner);
+                Self::end_shares(&self.inner);
                 return Err(error).context(format_args!("start {}", command.get_program().display()));
             }
         };
@@ -469,7 +712,7 @@ impl Engine for Machine {
     }
 
     fn request_stop(&self) -> Result<()> {
-        match api(&self.inner.api, "PUT", "vm.power-button") {
+        match api(&self.inner.api, "PUT", "vm.power-button", None) {
             Ok((200..=299, _)) => Ok(()),
             Ok((status, body)) => Err(failed(format_args!(
                 "cloud-hypervisor didn't press the power button ({status}): {}",
@@ -500,6 +743,94 @@ impl Engine for Machine {
         } else {
             Err(failed("cloud-hypervisor didn't end in time."))
         }
+    }
+
+    fn share(&self, shares: &[Share]) -> Result<()> {
+        let wanted: BTreeMap<&str, &Share> =
+            shares.iter().map(|share| (share.name.as_str(), share)).collect();
+        let going: Vec<String> = {
+            let state = self.inner.state.lock().unwrap();
+            state
+                .shares
+                .iter()
+                .filter(|(name, served)| wanted.get(name.as_str()) != Some(&&served.share))
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        for name in going {
+            let removed = api(
+                &self.inner.api,
+                "PUT",
+                "vm.remove-device",
+                Some(&serde_json::json!({ "id": device_id(&name) })),
+            );
+            match removed {
+                Ok((200..=299, _)) => {}
+                Ok((status, body)) => {
+                    return Err(failed(format_args!(
+                        "cloud-hypervisor didn't remove the share \"{name}\" ({status}): {}",
+                        body.trim()
+                    )));
+                }
+                Err(error) => {
+                    return Err(failed(format_args!(
+                        "Couldn't ask cloud-hypervisor to remove the share \"{name}\": {error}."
+                    )));
+                }
+            }
+            let served = self.inner.state.lock().unwrap().shares.remove(&name);
+            if let Some(served) = served {
+                if let Some(server) = served.server {
+                    end(server);
+                }
+                remove_share_sockets(&served.socket);
+            }
+        }
+        for share in shares {
+            if self.inner.state.lock().unwrap().shares.contains_key(&share.name) {
+                continue;
+            }
+            let socket = socket_path(
+                &self.inner.directory,
+                &self.inner.id,
+                &share_socket_name(&share.name),
+            )?;
+            let server = Self::start_virtiofsd(share, &socket)?;
+            let body = serde_json::json!({
+                "tag": share.name,
+                "socket": socket,
+                "id": device_id(&share.name),
+                "num_queues": 1,
+                "queue_size": 1024,
+            });
+            let added = api(&self.inner.api, "PUT", "vm.add-fs", Some(&body));
+            let refused = match added {
+                Ok((200..=299, _)) => None,
+                Ok((status, body)) => Some(format!(
+                    "cloud-hypervisor didn't add the share \"{}\" ({status}): {}",
+                    share.name,
+                    body.trim()
+                )),
+                Err(error) => Some(format!(
+                    "Couldn't ask cloud-hypervisor to add the share \"{}\": {error}.",
+                    share.name
+                )),
+            };
+            if let Some(refused) = refused {
+                end(server);
+                remove_share_sockets(&socket);
+                return Err(failed(refused));
+            }
+            self.inner.state.lock().unwrap().shares.insert(
+                share.name.clone(),
+                Served {
+                    share: share.clone(),
+                    socket,
+                    server: Some(server),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn connect(&self, port: u32) -> Result<OwnedFd> {
@@ -576,13 +907,41 @@ mod tests {
                 .unwrap();
             request
         });
-        let (status, body) = api(&socket, "GET", "vm.info").unwrap();
+        let (status, body) = api(&socket, "GET", "vm.info", None).unwrap();
         assert_eq!((status, body.as_str()), (200, "{\"state\":\"Running\"}"));
         assert!(
             server
                 .join()
                 .unwrap()
                 .starts_with("GET /api/v1/vm.info HTTP/1.1\r\n")
+        );
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_body_goes_with_its_length() {
+        let folder = std::env::temp_dir().join(format!("ch-api-body-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let socket = folder.join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.ends_with(b"}") {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+            }
+            stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let body = serde_json::json!({ "id": "fs-a" });
+        let (status, _) = api(&socket, "PUT", "vm.remove-device", Some(&body)).unwrap();
+        assert_eq!(status, 204);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("PUT /api/v1/vm.remove-device HTTP/1.1\r\n"));
+        assert!(
+            request.contains("Content-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"id\":\"fs-a\"}")
         );
         std::fs::remove_dir_all(&folder).unwrap();
     }

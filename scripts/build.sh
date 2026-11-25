@@ -4,7 +4,8 @@
 #
 # With a target, such as aarch64-unknown-linux-musl or x86_64-apple-darwin, it builds for that
 # instead, into dist/<target>/<name>. For Linux that is a static program, and passt goes next to it
-# when this runs on Linux on the same processor (scripts/build-passt.sh). From a Mac, zig is the C
+# when this runs on Linux on the same processor (scripts/build-passt.sh), and virtiofsd too when
+# Docker is there (scripts/build-virtiofsd.sh). From a Mac, zig is the C
 # compiler for Linux: zstd is C.
 #
 # A program for macOS is signed with the virtualization entitlement, without which it can't run
@@ -64,8 +65,13 @@ case $target in
     *-linux-*)
         if [ "$(uname)" = Linux ] && [ "$(uname -m)" = "${target%%-*}" ]; then
             scripts/build-passt.sh "$out" >/dev/null
+            if docker info >/dev/null 2>&1; then
+                scripts/build-virtiofsd.sh "$out" >/dev/null
+            else
+                echo "build: virtiofsd isn't built here: that takes Docker that this user can use. Shared folders use the system's virtiofsd." >&2
+            fi
         else
-            echo "build: passt isn't built here: that takes Linux on the same processor. Machines use the system's passt." >&2
+            echo "build: passt and virtiofsd aren't built here: that takes Linux on the same processor. Machines use the system's." >&2
         fi
         ;;
 esac

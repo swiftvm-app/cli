@@ -99,6 +99,9 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 if machine.nested {
                     rows.push(("Nested", "yes: the guest can run machines of its own".into()));
                 }
+                for (index, share) in machine.shares.iter().enumerate() {
+                    rows.push((if index == 0 { "Shared" } else { "" }, crate::share_line(share)));
+                }
                 match &guest {
                     Some(Ok(info)) => {
                         rows.push(("System", info.system.clone().unwrap_or_else(|| "unknown".into())));
@@ -120,7 +123,13 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                     None => {}
                 }
                 for (label, value) in rows {
-                    println!("{:<12}{}", format!("{label}:"), plain(&value));
+                    // A row that goes on the one before it has no label.
+                    let label = if label.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{label}:")
+                    };
+                    println!("{label:<12}{}", plain(&value));
                 }
             }
             let (guest, guest_error) = match guest {

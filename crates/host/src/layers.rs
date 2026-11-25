@@ -646,6 +646,7 @@ mod tests {
                 snapshots,
                 automatic: None,
                 nested: false,
+                shares: Vec::new(),
             }
             .save(&self.machine)
             .unwrap();

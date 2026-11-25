@@ -8,14 +8,19 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use proto::agent::{AGENT_PORT, AgentHello, GuestInfo, Job, ask, greet_agent, run_job};
+use proto::agent::{AGENT_PORT, AgentHello, GuestInfo, Job, Mount, ask, greet_agent, run_job};
 
+use crate::lock::Lock;
 use crate::{AGENT, AGENT_BUILT, Error, ErrorCode, NAME, Result, client};
 
 /// How long the agent gets to say hello, and to answer.
 const PATIENCE: Duration = Duration::from_secs(10);
 /// How long a replaced agent gets to come back.
 const RESTART: Duration = Duration::from_secs(20);
+/// Held while the agent of the machine in the folder is replaced.
+const UPDATE_LOCK: &str = "agent-update.lock";
+/// How long the agent gets to mount shared folders.
+const MOUNT_PATIENCE: Duration = Duration::from_secs(60);
 /// A guest's clock that is off by more than this is set.
 const CLOCK_TOLERANCE: Duration = Duration::from_secs(2);
 
@@ -106,14 +111,45 @@ fn update(directory: &Path, mut connection: Connection) -> Result<Connection> {
 /// A connection to the agent of the machine in `directory` on which it has taken `job` on, and
 /// what it answered.
 pub(crate) fn start(directory: &Path, job: &Job) -> Result<(UnixStream, Option<GuestInfo>)> {
+    let mut connection = ready(directory)?;
+    let answer = ask(&mut connection.stream, job)?;
+    _ = connection.stream.set_read_timeout(None);
+    Ok((connection.stream, answer))
+}
+
+/// Has the guest mount `mounts`, and no other shared folders. `false` when its agent doesn't
+/// answer yet, which may be because the guest is still starting.
+pub(crate) fn mount(directory: &Path, mounts: Vec<Mount>) -> Result<bool> {
+    let mut connection = match ready(directory) {
+        Ok(connection) => connection,
+        Err(error) if error.code == ErrorCode::Guest => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    // The agent waits a while for a device that has only just been added.
+    _ = connection.stream.set_read_timeout(Some(MOUNT_PATIENCE));
+    ask(&mut connection.stream, &Job::Mount { mounts })?;
+    Ok(true)
+}
+
+/// A connection to the agent that is ready for a job: of this program's version or newer, in a
+/// guest whose clock is right.
+fn ready(directory: &Path) -> Result<Connection> {
     let mut connection = connect(directory)?;
     if outdated(&connection.hello) {
-        // An agent that couldn't be replaced, in a guest whose disk is full for one, still
-        // does the job: that may be what frees the disk.
-        connection = match update(directory, connection) {
-            Ok(connection) => connection,
-            Err(_) => connect(directory)?,
-        };
+        // One replacement at a time: two at once, from a command and from the machine's own
+        // process, would write the new agent over each other. Whoever waited finds it new.
+        let lock = directory.join(UPDATE_LOCK);
+        let _updating = Lock::take_within(&lock, RESTART + PATIENCE).ok().flatten();
+        drop(connection);
+        connection = connect(directory)?;
+        if outdated(&connection.hello) {
+            // An agent that couldn't be replaced, in a guest whose disk is full for one, still
+            // does the job: that may be what frees the disk.
+            connection = match update(directory, connection) {
+                Ok(connection) => connection,
+                Err(_) => connect(directory)?,
+            };
+        }
     }
     let off = now().abs_diff(connection.hello.time);
     if off > CLOCK_TOLERANCE.as_nanos() as u64 {
@@ -121,9 +157,7 @@ pub(crate) fn start(directory: &Path, job: &Job) -> Result<(UnixStream, Option<G
         _ = ask(&mut connection.stream, &Job::SetClock { nanoseconds: now() });
         connection = connect(directory)?;
     }
-    let answer = ask(&mut connection.stream, job)?;
-    _ = connection.stream.set_read_timeout(None);
-    Ok((connection.stream, answer))
+    Ok(connection)
 }
 
 /// What the guest is and how it is doing.

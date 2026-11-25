@@ -20,6 +20,8 @@ pub(crate) struct Seed<'a> {
     pub mac_address: &'a str,
     /// The guest's agent, which the first start installs.
     pub agent: &'a [u8],
+    /// The account's user ID, if it is to be one in particular.
+    pub uid: Option<u32>,
     /// What the first start sets up once it is over, one after the other.
     pub scripts: &'a [Script],
 }
@@ -112,9 +114,14 @@ impl Seed<'_> {
             "users:".into(),
             format!("  - name: {user}"),
             "    shell: /bin/bash".into(),
+        ];
+        if let Some(uid) = self.uid {
+            lines.push(format!("    uid: {uid}"));
+        }
+        lines.extend([
             format!("    sudo: {}", yaml("ALL=(ALL) NOPASSWD:ALL")),
             format!("    lock_passwd: {}", self.password.is_none()),
-        ];
+        ]);
         match self.password {
             Some(password) => lines.extend([
                 "ssh_pwauth: true".into(),
@@ -237,16 +244,23 @@ mod tests {
             password: Some("it's \"#: {odd}\\"),
             mac_address: "52:54:00:AA:BB:CC",
             agent: b"agent",
+            uid: None,
             scripts: &[],
         };
         let settings = seed.user_data();
         assert!(settings.starts_with("#cloud-config\n"));
         assert!(settings.contains(r##"      password: "it's \"#: {odd}\\""##));
         assert!(settings.contains("    lock_passwd: false\n"));
+        assert!(!settings.contains("uid:"));
         assert!(
             seed.network_config()
                 .contains("macaddress: \"52:54:00:aa:bb:cc\"")
         );
+        let owned = Seed {
+            uid: Some(501),
+            ..seed
+        };
+        assert!(owned.user_data().contains("    shell: /bin/bash\n    uid: 501\n"));
     }
 
     #[test]
@@ -258,6 +272,7 @@ mod tests {
             password: None,
             mac_address: "52:54:00:aa:bb:cc",
             agent: b"agent",
+            uid: None,
             scripts: &[],
         };
         let files = seed.files();
@@ -291,6 +306,7 @@ mod tests {
             password: None,
             mac_address: "52:54:00:aa:bb:cc",
             agent: b"agent",
+            uid: None,
             scripts: &[Script::find("docker").unwrap()],
         };
         seed.write(&path).unwrap();

@@ -26,6 +26,7 @@ mod saved;
 mod screen;
 mod scripts;
 mod seed;
+mod shares;
 mod store;
 
 pub use desktop::{Button, Direction, Picture};
@@ -40,7 +41,8 @@ pub use proto::relay::relay;
 pub use proto::{Error, ErrorCode, Input, NAME, Result, SCREEN_PORT, ScreenSize};
 pub use saved::ImageKind;
 pub use scripts::built_in as setup_scripts;
-pub use store::{Automatic, Config, DiskConfig, DiskFormat, Snapshot, Store};
+pub use shares::{ShareInfo, guest_path as shared_path};
+pub use store::{Automatic, Config, DiskConfig, DiskFormat, Share, Snapshot, Store};
 
 use std::fmt::Display;
 use std::path::Path;

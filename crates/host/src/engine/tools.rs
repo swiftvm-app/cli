@@ -62,6 +62,13 @@ const FIRMWARE: Pinned = if cfg!(target_arch = "aarch64") {
 };
 
 const PASST: &str = "passt";
+const VIRTIOFSD: &str = "virtiofsd";
+/// Where distributions put virtiofsd, which isn't on the `PATH`.
+const VIRTIOFSD_PLACES: [&str; 3] = [
+    "/usr/libexec/virtiofsd",
+    "/usr/lib/qemu/virtiofsd",
+    "/usr/lib/virtiofsd",
+];
 
 /// Where the engine's programs are.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -150,6 +157,30 @@ fn passt() -> Result<PathBuf> {
         ));
     }
     Ok(passt)
+}
+
+/// virtiofsd, which serves a shared folder to a machine: next to this program, where the
+/// release puts one, or the system's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn virtiofsd() -> Result<PathBuf> {
+    beside_program(VIRTIOFSD)
+        .or_else(|| {
+            VIRTIOFSD_PLACES
+                .iter()
+                .map(PathBuf::from)
+                .chain(
+                    std::env::var_os("PATH")
+                        .map(|path| std::env::split_paths(&path).map(|directory| directory.join(VIRTIOFSD)).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                )
+                .find(|candidate| candidate.is_file())
+        })
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::NotFound,
+                "virtiofsd isn't installed, and shared folders need it. Install the virtiofsd package, or put virtiofsd next to this program.",
+            )
+        })
 }
 
 #[cfg(test)]

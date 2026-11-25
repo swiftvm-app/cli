@@ -157,6 +157,21 @@ fn ask_for(directory: &Path, request: &Request, patience: Duration) -> Result<(U
 
 /// The version of the control protocol that has the screen's requests.
 const SCREEN_PROTOCOL: u32 = 2;
+/// The one that has [`Request::Shares`].
+const SHARES_PROTOCOL: u32 = 3;
+/// How long the machine's process gets to share folders: it may start a program for each, and
+/// waits for the guest to mount them, which may first have its agent replaced.
+const SHARES_PATIENCE: Duration = Duration::from_secs(120);
+
+/// Has the machine's process share the folders that the machine's settings list now. `false`
+/// when it was started by an older build, which can't.
+pub(crate) fn shares(directory: &Path) -> Result<bool> {
+    let (_, version) = connect(directory)?;
+    if version < SHARES_PROTOCOL {
+        return Ok(false);
+    }
+    ask(directory, &Request::Shares, SHARES_PATIENCE).map(|_| true)
+}
 
 /// How long the screen gets to answer: the first time, the guest's VNC server is connected to
 /// through the agent, which may be replaced by a newer one on the way.

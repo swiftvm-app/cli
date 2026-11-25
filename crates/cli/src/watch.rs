@@ -155,6 +155,7 @@ mod tests {
             user: "username".into(),
             created: 0,
             nested: false,
+            shares: Vec::new(),
         }
     }
 

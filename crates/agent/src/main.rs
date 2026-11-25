@@ -14,6 +14,7 @@ mod account;
 mod freeze;
 mod identity;
 mod job;
+mod mount;
 mod serve;
 mod system;
 #[cfg(target_os = "linux")]
@@ -102,6 +103,8 @@ fn serve_socket_device() -> ExitCode {
 
     // An agent that ended while the file system was frozen left it so.
     freeze::thaw();
+    // Off the way of the host's first connections, which may be what mounts them anyway.
+    std::thread::spawn(mount::restore);
     let agent = Arc::new(Agent::new());
     // The socket device's driver may not be there yet this early in the system's start.
     let mut said = false;

@@ -6,12 +6,13 @@ use std::net::TcpStream;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use proto::agent::{AGENT_PROTOCOL, AgentHello, Answer, Ended, Job, Kind, read_frame, write_frame};
 use proto::{Error, ErrorCode};
 
-use crate::{freeze, job, system};
+use crate::{freeze, job, mount, system};
 
 /// How long the host gets to say hello and what it wants.
 const ASKING: Duration = Duration::from_secs(30);
@@ -93,6 +94,13 @@ impl Agent {
             Job::Tunnel { port } => tunnel(stream, port),
             Job::Update { size } => self.update(stream, size),
             Job::Freeze { seconds } => freeze::run(stream, seconds),
+            Job::Mount { mounts } => answer(
+                &mut stream,
+                &match mount::run(&mounts) {
+                    Ok(()) => Answer::yes(),
+                    Err(error) => Answer::no(error),
+                },
+            ),
         }
     }
 
@@ -100,8 +108,10 @@ impl Agent {
     /// system starts the new one. Commands that run are left running, but connections to them
     /// end with this program.
     fn update(&self, mut stream: UnixStream, size: u64) {
+        // A name of its own for each update, so that two at once don't write into one file.
+        static UPDATES: AtomicU64 = AtomicU64::new(0);
         let mut name = self.program.clone().into_os_string();
-        name.push(".new");
+        name.push(format!(".new-{}", UPDATES.fetch_add(1, Ordering::SeqCst)));
         let new = PathBuf::from(name);
         let file = std::fs::OpenOptions::new()
             .write(true)

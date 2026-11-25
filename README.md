@@ -30,14 +30,14 @@ scripts/install.sh ~/bin      # or into another folder
 | System | Needs | Gets |
 |---|---|---|
 | macOS 14 or later | Rust, and the Linux musl target for this processor (`rustup target add aarch64-unknown-linux-musl`), which the guest agent is built for | The program, signed with the virtualization entitlement |
-| Linux with KVM | Rust with the musl target for this processor, `musl-tools`, a C compiler and `curl`. The user must be in the `kvm` group | A static program, with `passt` next to it |
+| Linux with KVM | Rust with the musl target for this processor, `musl-tools`, a C compiler and `curl`, and Docker for `virtiofsd`. The user must be in the `kvm` group | A static program, with `passt` and `virtiofsd` next to it. Without Docker, shared folders use the system's `virtiofsd` |
 
-Installing again while machines run is safe: they keep the program they started with. To uninstall, delete the program (and `passt` on Linux) from the folder.
+Installing again while machines run is safe: they keep the program they started with. To uninstall, delete the program (and `passt` and `virtiofsd` on Linux) from the folder.
 
 ## Use
 
 ```sh
-svm create debian-13 --name dev
+svm create debian-13 --name dev --share ~/Projects
 svm start dev
 svm wait dev
 svm ssh dev

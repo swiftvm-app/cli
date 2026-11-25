@@ -14,8 +14,8 @@ use crate::{Error, ErrorCode};
 
 /// The newest version of the protocol that this build speaks.
 ///
-/// 2 added [`Request::Screenshot`] and [`Request::Input`].
-pub const PROTOCOL: u32 = 2;
+/// 2 added [`Request::Screenshot`] and [`Request::Input`], 3 [`Request::Shares`].
+pub const PROTOCOL: u32 = 3;
 /// The oldest one. A machine keeps the process it was started with, so a newer command has to
 /// talk to an older process, and the other way round after a downgrade.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -57,6 +57,10 @@ pub enum Request {
     Input {
         events: Vec<Input>,
     },
+    /// Shares the folders that the machine's settings list now, and no others, and answers once
+    /// the guest has them mounted, or once that has been asked of a guest whose agent doesn't
+    /// answer yet.
+    Shares,
 }
 
 /// One thing done with the guest's keyboard or pointer.
@@ -304,6 +308,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::Screenshot).unwrap(),
             r#"{"request":"screenshot"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Shares).unwrap(),
+            r#"{"request":"shares"}"#
         );
         let shot = Response {
             screenshot: Some(Screenshot {
