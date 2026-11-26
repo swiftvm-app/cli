@@ -11,6 +11,7 @@ use std::time::Duration;
 use host::{Ended, Error, ErrorCode, ExecOptions, GuestInfo, Host, MachineState, NAME, Result, SetupState};
 use serde_json::json;
 
+use crate::ui::{self, Tone, Ui};
 use crate::{Arguments, Done, invalid, plain, size};
 
 /// Passes each write on at once: what a command prints is shown as it prints it.
@@ -59,11 +60,6 @@ fn seconds(arguments: &Arguments, name: &str) -> Result<Option<Duration>> {
 }
 
 pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
-    let say = |text: String| {
-        if !json {
-            println!("{text}");
-        }
-    };
     match command {
         "info" => {
             let arguments = Arguments::parse(words, &[], &[])?;
@@ -75,10 +71,11 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 _ => None,
             };
             if !json {
+                let ui = Ui::stdout();
                 let mut rows = vec![
-                    ("Name", machine.name.clone()),
-                    ("State", format!("{:?}", machine.state).to_lowercase()),
-                    ("Image", machine.image.clone()),
+                    ("Name", ui.paint(Tone::Bold, &machine.name)),
+                    ("State", ui.state(machine.state)),
+                    ("Image", plain(&machine.image)),
                     ("Processors", machine.cpus.to_string()),
                     ("Memory", size(machine.memory)),
                     (
@@ -94,42 +91,41 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                             format!("{} of {}", size(machine.disk_used), size(machine.disk_size))
                         },
                     ),
-                    ("Account", machine.user.clone()),
+                    ("Account", plain(&machine.user)),
                 ];
                 if machine.nested {
                     rows.push(("Nested", "yes: the guest can run machines of its own".into()));
                 }
                 for (index, share) in machine.shares.iter().enumerate() {
-                    rows.push((if index == 0 { "Shared" } else { "" }, crate::share_line(share)));
+                    rows.push((
+                        if index == 0 { "Shared" } else { "" },
+                        plain(&crate::share_line(share)),
+                    ));
                 }
+                println!("{}\n{}", ui.paint(Tone::Heading, "Machine"), ui.pairs(&rows));
+                rows.clear();
                 match &guest {
                     Some(Ok(info)) => {
-                        rows.push(("System", info.system.clone().unwrap_or_else(|| "unknown".into())));
-                        rows.push(("Kernel", format!("{} ({})", info.kernel, info.arch)));
-                        rows.push(("Host name", info.host_name.clone()));
+                        rows.push(("System", plain(info.system.as_deref().unwrap_or("unknown"))));
+                        rows.push(("Kernel", plain(&format!("{} ({})", info.kernel, info.arch))));
+                        rows.push(("Host name", plain(&info.host_name)));
                         let addresses: Vec<String> = info
                             .addresses
                             .iter()
                             .map(|address| address.address.clone())
                             .collect();
-                        rows.push(("Addresses", addresses.join(", ")));
-                        rows.push(("Agent", info.agent.clone()));
+                        rows.push(("Addresses", plain(&addresses.join(", "))));
+                        rows.push(("Agent", plain(&info.agent)));
                         rows.push(("Started", if info.booted { "yes" } else { "not yet" }.into()));
                         if let Some(setup) = setup_line(info) {
-                            rows.push(("Setup", setup));
+                            rows.push(("Setup", plain(&setup)));
                         }
                     }
-                    Some(Err(error)) => rows.push(("Agent", error.message.clone())),
+                    Some(Err(error)) => rows.push(("Agent", ui.paint(Tone::Warning, &error.message))),
                     None => {}
                 }
-                for (label, value) in rows {
-                    // A row that goes on the one before it has no label.
-                    let label = if label.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{label}:")
-                    };
-                    println!("{label:<12}{}", plain(&value));
+                if !rows.is_empty() {
+                    println!("\n{}\n{}", ui.paint(Tone::Heading, "Guest"), ui.pairs(&rows));
                 }
             }
             let (guest, guest_error) = match guest {
@@ -158,11 +154,14 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 }
                 let line = setup_line(info);
                 if line.is_some() && line != shown {
-                    eprintln!("{}", plain(line.as_deref().unwrap_or_default()));
+                    eprintln!(
+                        "{}",
+                        Ui::stderr().paint(Tone::Bold, line.as_deref().unwrap_or_default())
+                    );
                     shown = line;
                 }
             })?;
-            say(format!("{name} is ready."));
+            ui::success(json, format!("{name} is ready."));
             Ok(json!({ "guest": info }).into())
         }
         "exec" => {
@@ -209,10 +208,10 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             let mut errors = Unbuffered(std::io::stderr());
             let ended = host.exec(name, options, input, &mut output, &mut errors)?;
             if ended.timed_out {
-                eprintln!("{NAME}: The command ran out of time, and was ended.");
+                ui::error("The command ran out of time, and was ended.");
             }
             if let Some(error) = &ended.error {
-                eprintln!("{NAME}: {}", plain(&error.message));
+                ui::error(&error.message);
             }
             Ok(Done {
                 result: serde_json::Value::Null,
@@ -239,7 +238,7 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                     ));
                 }
             }
-            say(format!("Copied {from} to {to}."));
+            ui::success(json, format!("Copied {from} to {to}."));
             Ok(json!({ "copied": { "from": from, "to": to } }).into())
         }
         "ssh" => {
@@ -340,10 +339,15 @@ fn forward(name: &str, ports: &[String], json: bool) -> Result<Done> {
         println!("{}", json!({ "forwarding": forwarding }));
         _ = std::io::stdout().flush();
     } else {
+        let ui = Ui::stderr();
         for (_, local, remote) in &listeners {
-            eprintln!("Forwarding localhost:{local} to port {remote} of {name}.");
+            eprintln!(
+                "Forwarding {} to port {remote} of {}.",
+                ui.paint(Tone::Bold, &format!("localhost:{local}")),
+                plain(name)
+            );
         }
-        eprintln!("Control-C stops.");
+        eprintln!("{}", ui.paint(Tone::Muted, "Control-C stops."));
     }
     let mut threads = Vec::new();
     for (listener, _, remote) in listeners {
@@ -354,7 +358,7 @@ fn forward(name: &str, ports: &[String], json: bool) -> Result<Done> {
                 std::thread::spawn(move || match host.tunnel(&name, remote) {
                     Ok(stream) => host::relay(connection, stream),
                     Err(error) if json => crate::json_note(json!({ "error": error })),
-                    Err(error) => eprintln!("{NAME}: {}", plain(&error.message)),
+                    Err(error) => ui::error(&error.message),
                 });
             }
         }));

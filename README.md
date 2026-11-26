@@ -44,6 +44,9 @@ svm ssh dev
 svm help
 ```
 
+Use `svm help create` or `svm image save --help` for command options and examples.
+Terminal output uses color automatically. Set `NO_COLOR=1` for plain text.
+
 Apps use `--json`, described in [docs/api.md](docs/api.md).
 
 ## Release

@@ -226,7 +226,7 @@ pub fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
                 return Err(invalid("Say what to open: an application, a file or a URL."));
             };
             host.open_in_guest(name, what)?;
-            say(format!("Opened {what}."));
+            crate::ui::success(json, format!("Opened {what}."));
             Ok(json!({ "opened": what }).into())
         }
         "clipboard" => {

@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::Duration;
 
-use host::{Host, Machine, MachineState, Result};
+use host::{Host, Machine, Result};
 use serde_json::{Value, json};
 
+use crate::ui::{Tone, Ui};
 use crate::{Arguments, Done};
 
 /// How often the store is looked at.
@@ -23,36 +24,41 @@ fn shape(machine: &Machine) -> Value {
     value
 }
 
-fn state(state: MachineState) -> &'static str {
-    match state {
-        MachineState::Running => "running",
-        MachineState::Stopped => "stopped",
-        MachineState::Broken => "broken",
-    }
-}
-
 /// The lines that tell a person what changed between `before` and `now`.
-fn changes(before: Option<&BTreeMap<String, Machine>>, now: &BTreeMap<String, Machine>) -> Vec<String> {
+fn changes(
+    ui: Ui,
+    before: Option<&BTreeMap<String, Machine>>,
+    now: &BTreeMap<String, Machine>,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(before) = before else {
         if now.is_empty() {
             lines.push("No machines.".to_string());
         }
         for machine in now.values() {
-            lines.push(format!("{}: {}", machine.name, state(machine.state)));
+            lines.push(format!(
+                "{}: {}",
+                ui.paint(Tone::Bold, &machine.name),
+                ui.state(machine.state)
+            ));
         }
         return lines;
     };
     for name in before.keys().filter(|name| !now.contains_key(*name)) {
-        lines.push(format!("{name}: deleted"));
+        lines.push(format!(
+            "{}: {}",
+            ui.paint(Tone::Bold, name),
+            ui.paint(Tone::Warning, "deleted")
+        ));
     }
     for (name, machine) in now {
+        let label = ui.paint(Tone::Bold, name);
         match before.get(name) {
-            None => lines.push(format!("{name}: created, {}", state(machine.state))),
+            None => lines.push(format!("{label}: created, {}", ui.state(machine.state))),
             Some(old) if old.state != machine.state => {
-                lines.push(format!("{name}: {}", state(machine.state)));
+                lines.push(format!("{label}: {}", ui.state(machine.state)));
             }
-            Some(old) if shape(old) != shape(machine) => lines.push(format!("{name}: changed")),
+            Some(old) if shape(old) != shape(machine) => lines.push(format!("{label}: changed")),
             Some(_) => {}
         }
     }
@@ -104,6 +110,7 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
     let host = Host::open()?;
     let mut last: Option<BTreeMap<String, Machine>> = None;
     let mut last_shapes = None;
+    let ui = Ui::new(std::io::stdout(), !json);
     loop {
         let machines = host.list()?;
         let shapes: Vec<Value> = machines.iter().map(shape).collect();
@@ -116,7 +123,7 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
             let written = if json {
                 writeln!(output, "{}", json!({ "machines": machines }))
             } else {
-                changes(last.as_ref(), &now)
+                changes(ui, last.as_ref(), &now)
                     .iter()
                     .try_for_each(|line| writeln!(output, "{line}"))
             };
@@ -137,6 +144,7 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use host::MachineState;
 
     fn machine(name: &str, state: MachineState, disk_used: u64) -> Machine {
         Machine {
@@ -176,10 +184,11 @@ mod tests {
             machine("a", MachineState::Running, 1),
             machine("c", MachineState::Stopped, 1),
         ]);
-        assert_eq!(changes(None, &before), ["a: stopped", "b: running"]);
-        assert_eq!(changes(None, &BTreeMap::new()), ["No machines."]);
+        let ui = Ui::new(std::io::stdout(), false);
+        assert_eq!(changes(ui, None, &before), ["a: stopped", "b: running"]);
+        assert_eq!(changes(ui, None, &BTreeMap::new()), ["No machines."]);
         assert_eq!(
-            changes(Some(&before), &now),
+            changes(ui, Some(&before), &now),
             ["b: deleted", "a: running", "c: created, stopped"]
         );
     }
@@ -188,7 +197,7 @@ mod tests {
     fn what_the_disk_takes_up_is_no_change() {
         let before = map(&[machine("a", MachineState::Running, 1)]);
         let now = map(&[machine("a", MachineState::Running, 2)]);
-        assert!(changes(Some(&before), &now).is_empty());
+        assert!(changes(Ui::new(std::io::stdout(), false), Some(&before), &now).is_empty());
         assert_eq!(shape(&before["a"]), shape(&now["a"]));
     }
 }
