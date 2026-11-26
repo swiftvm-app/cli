@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "proto",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "host",
  "libc",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "disk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32fast",
  "graviola",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "block2",
  "crc32fast",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
