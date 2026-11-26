@@ -4,132 +4,24 @@ mod console;
 mod desktop;
 mod disk;
 mod guest;
+mod help;
 mod image;
 mod mcp;
+mod ui;
 mod watch;
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use host::{CreateOptions, Error, ErrorCode, Host, Machine, MachineState, NAME, Progress, Result, ShareInfo};
 use serde_json::json;
+use ui::{Tone, Ui};
 
 /// The version of what `--json` prints, and of `watch`'s lines: docs/api.md. Fields may be added
 /// to a version; one that renames, removes or changes the meaning of anything is a new version.
 const API: u32 = 1;
-
-fn usage() -> String {
-    format!(
-        "usage: {NAME} <command> [options]
-
-  images                     The images a machine can be created from: the catalog's, and
-                             those made from machines.
-      --all                  Also the automatic ones.
-  create <image>             Create a machine. It isn't started. A machine of a catalog image
-                             with setup scripts starts from the automatic image that the first
-                             one with the same scripts and account left, and skips them.
-      --name <name>          Its name. Without one it is named after the image.
-      --cpus <count>         Processors. 4 unless this computer has fewer.
-      --memory <size>        Memory, such as 4G or 512M. 4G unless said.
-      --disk <size>          The size of its disk. 32G unless said.
-      --user <name>          The account to create. This computer's user name unless said.
-      --password <password>  The account's password. Without one it has none to sign in with.
-      --script <script>      Set something up once the first start is over: {scripts}, or the
-                             path of a script. Can be given more than once.
-      --nested               Let the guest run virtual machines of its own. On a Mac with an
-                             M3 or later and macOS 15 or later.
-      --share <folder>       Share a folder of this computer, as share does. Can be given more
-                             than once.
-  list                       The machines and whether they are running.
-  watch                      Say what changes about the machines, until stopped. With --json,
-                             a line like list's at first and whenever a machine changes.
-  start <machine>            Start a machine. Returns once it has started to boot.
-  stop <machine>             Shut a machine down, and cut its power if that takes too long.
-      --timeout <seconds>    How long the guest gets to shut down. 30 unless said.
-      --force                Cut the power at once.
-  share <machine> <folder>   Share a folder of this computer with the guest, which reads and
-                             writes it in place at /mnt/shared/<name>. A running machine gets
-                             it at once. Files the guest writes there belong to this user.
-      --name <name>          Its name in the guest. The folder's own unless said.
-      --read-only            The guest can't change what is in it.
-  unshare <machine> <name>   Stop sharing a folder.
-  delete <machine>           Delete a machine and its disk.
-      --force                Also when it is running.
-  console <machine>          Connect this terminal to a machine's serial console.
-  info <machine>             A machine, and what its guest says about itself.
-  wait <machine>             Wait until the guest is up and its setup scripts have run.
-      --timeout <seconds>    How long to wait. As long as it takes unless said.
-  exec <machine> -- <command> [arguments]
-                             Run a command in the guest. Input that is piped in is passed on.
-                             Ends with the command's exit status.
-      --user <name>          The account to run it as. The machine's own unless said.
-      --cwd <folder>         Where to run it. The account's home folder unless said.
-      --env <name=value>     Add to its environment. Can be given more than once.
-      --timeout <seconds>    End it after this long, with exit status 124.
-  cp <from> <to>             Copy a file or folder into or out of a guest, as cp -R does. The
-                             guest's side is written <machine>:<path>, from the home folder.
-      --user <name>          The account that the copy is made as.
-  ssh <machine> [-- <arguments for ssh>]
-                             Sign in to the guest with ssh, through its agent.
-  forward <machine> <port>[:<guest port>]...
-                             Pass connections to ports of this computer's localhost on to ports
-                             of the guest, until stopped.
-  tunnel <machine> <port>    Connect this program's input and output to a port of the guest, as
-                             ssh's ProxyCommand does.
-  snapshot <machine> <name>  Take a snapshot of the machine's disk. A running machine is shut
-                             down for it, and started again.
-  snapshots <machine>        The machine's snapshots.
-  revert <machine> <name>    Put the disk back as it was at a snapshot. What was written since
-                             is lost. A running machine is shut down for it, and started again.
-  delete-snapshot <machine> <name>
-                             Forget a snapshot.
-  image save <machine> <name>
-                             Make an image of a machine, which machines can be created from
-                             with their own host name, machine ID and SSH keys. A running
-                             machine is shut down for it, and started again.
-      --delete               Delete the machine once the image is made.
-  image delete <image>       Delete an image made from a machine. Not while machines use it.
-  image rename <image> <name>
-  image export <image> <file>
-                             Write an image made from a machine to one file.
-  image import <file>        Read an image that was exported.
-      --name <name>          Its name here. The one it had unless said.
-  vnc <machine>              Where the machine's screen is served to VNC viewers and apps: a
-                             Unix socket, without a password, that only this user can open.
-  screenshot <machine> [<file> | -]
-                             The guest's screen as a PNG, at its full size. Without a file it
-                             goes to the runtime folder, and its path is printed.
-  click <machine> <x> <y>    Click at a pixel of the screen, from its top left corner.
-      --right, --middle      With another button.
-      --double, --count <n>  Click twice, or up to three times.
-  move <machine> <x> <y>     Move the pointer there.
-  drag <machine> <x> <y> <to x> <to y>
-                             Drag from one place to another.
-  scroll <machine> [<x> <y>] up|down|left|right [<notches>]
-                             Turn the wheel, 3 notches unless said, over the middle of the
-                             screen unless said.
-  type <machine> <text>      Type text at the keyboard's focus.
-  key <machine> <key>...     Press keys one after the other: Return, Escape, Tab, F5, ctrl+s,
-                             ctrl+shift+t.
-  open <machine> <what>      Open an application by name, a file or a URL in the guest's desktop.
-  clipboard <machine> [<text>]
-                             Print the guest's clipboard, or put text on it.
-  mcp                        Serve the Model Context Protocol on standard input and output, for
-                             AI agents: `{NAME} help mcp` says how to add it.
-  disk info <machine>        The layers of a machine's disk, and what each holds. Takes the path
-                             of a .layer file too.
-  disk check <machine>       Read every layer of a stopped machine's disk back and check it. Ends
-                             with status 1 if anything is wrong.
-  version
-
-Every command takes --json, and then prints one JSON document: its result, or
-{{\"error\": {{\"code\": ..., \"message\": ...}}}}. Long commands also write how far they
-have come as JSON lines on the error output.",
-        scripts = host::setup_scripts().join(", ")
-    )
-}
 
 /// The words of a command line, sorted into what they are.
 struct Arguments {
@@ -274,26 +166,6 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Prints `rows` as columns two spaces apart, each as wide as its widest cell.
-fn print_table(rows: &[Vec<String>]) {
-    let widths: Vec<usize> = (0..rows[0].len())
-        .map(|column| {
-            rows.iter()
-                .map(|row| row[column].chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    for row in rows {
-        let line: Vec<String> = row
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| format!("{cell:<width$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
-}
-
 /// How long ago a moment in seconds since 1970 was, roughly.
 fn ago(seconds: u64) -> String {
     let now = std::time::SystemTime::now()
@@ -318,19 +190,22 @@ fn json_note(value: serde_json::Value) {
 struct Meter {
     /// The result is JSON, and so is each step: one line each ([`json_note`]).
     json: bool,
-    /// A terminal gets a line that is kept up to date, anything else one line for each step.
-    live: bool,
+    ui: Ui,
     step: Option<&'static str>,
     shown: Instant,
+    line_width: usize,
+    detail_below: bool,
 }
 
 impl Meter {
     fn new(json: bool) -> Self {
         Self {
             json,
-            live: std::io::stderr().is_terminal(),
+            ui: Ui::new(std::io::stderr(), !json),
             step: None,
             shown: Instant::now(),
+            line_width: 0,
+            detail_below: false,
         }
     }
 
@@ -379,20 +254,47 @@ impl Meter {
             return;
         }
         let mut output = std::io::stderr().lock();
-        if !self.live {
-            if is_new {
-                _ = writeln!(output, "{step}...");
+        if let Some(columns) = self.ui.columns {
+            if due {
+                self.shown = Instant::now();
+                self.draw(&mut output, columns, step, &detail, is_new);
             }
-        } else if due {
-            self.shown = Instant::now();
-            _ = write!(output, "\r\x1b[K{step}: {detail}");
+        } else if is_new {
+            _ = writeln!(output, "{step}...");
+        }
+    }
+
+    fn draw(&mut self, output: &mut impl Write, columns: usize, step: &str, detail: &str, is_new: bool) {
+        if is_new {
+            self.detail_below = false;
+        }
+        let width = step.len() + 2 + detail.len();
+        if width >= columns && !self.detail_below {
+            self.clear_line(output);
+            _ = writeln!(output, "{}", self.ui.paint(Tone::Heading, step));
+            self.detail_below = true;
+            self.line_width = 0;
+        }
+        let (line, width) = if self.detail_below {
+            // Progress details are ASCII numbers, units and punctuation.
+            let detail = &detail[..detail.len().min(columns.saturating_sub(1))];
+            (detail.to_string(), detail.len())
+        } else {
+            (format!("{}  {detail}", self.ui.paint(Tone::Heading, step)), width)
+        };
+        let padding = self.line_width.saturating_sub(width);
+        _ = write!(output, "\r{line}{:padding$}", "");
+        self.line_width = width;
+    }
+
+    fn clear_line(&self, output: &mut impl Write) {
+        if self.line_width > 0 {
+            _ = write!(output, "\r{:width$}\r", "", width = self.line_width);
         }
     }
 
     fn finish(&self) {
-        if !self.json && self.live && self.step.is_some() {
-            eprint!("\r\x1b[K");
-        }
+        self.clear_line(&mut std::io::stderr().lock());
     }
 }
 
@@ -408,21 +310,16 @@ fn share_line(share: &ShareInfo) -> String {
     line
 }
 
-fn machine_row(machine: &Machine) -> Vec<String> {
-    let state = match machine.state {
-        MachineState::Running => "running",
-        MachineState::Stopped => "stopped",
-        MachineState::Broken => "broken",
-    };
+fn machine_row(ui: Ui, machine: &Machine) -> [String; 6] {
+    let name = ui.paint(Tone::Bold, &machine.name);
+    let state = ui.state(machine.state);
     if machine.state == MachineState::Broken {
-        return [&machine.name, state, "-", "-", "-", "-"]
-            .map(String::from)
-            .to_vec();
+        return [name, state, "-".into(), "-".into(), "-".into(), "-".into()];
     }
-    vec![
-        machine.name.clone(),
-        state.to_string(),
-        machine.image.clone(),
+    [
+        name,
+        state,
+        plain(&machine.image),
         machine.cpus.to_string(),
         size(machine.memory),
         format!("{} of {}", size(machine.disk_used), size(machine.disk_size)),
@@ -443,12 +340,14 @@ impl From<serde_json::Value> for Done {
 
 /// Runs a command.
 fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
-    let say = |text: String| {
-        if !json {
-            println!("{text}");
-        }
-    };
+    let say = |message| ui::success(json, message);
     let result = match command {
+        "version" | "--version" => {
+            if !json {
+                println!("{}", Ui::stdout().version());
+            }
+            Ok(json!({ "name": NAME, "version": env!("CARGO_PKG_VERSION"), "api": API }))
+        }
         "images" => return image::list(words, json),
         "image" => return image::run(words, json),
         "snapshot" | "snapshots" | "revert" | "delete-snapshot" => {
@@ -486,18 +385,24 @@ fn run(command: &str, words: &[String], json: bool) -> Result<Done> {
             Arguments::parse(words, &[], &[])?.nothing_else()?;
             let machines = Host::open()?.list()?;
             if !json && machines.is_empty() {
-                println!("No machines.");
+                let ui = Ui::stdout();
+                println!(
+                    "No machines. Browse available images with {}.",
+                    ui.paint(Tone::Bold, &format!("{NAME} images"))
+                );
             } else if !json {
-                let mut rows = vec![
-                    ["NAME", "STATE", "IMAGE", "CPUS", "MEMORY", "DISK"]
-                        .map(String::from)
-                        .to_vec(),
-                ];
-                rows.extend(machines.iter().map(machine_row));
-                print_table(&rows);
+                let ui = Ui::stdout();
+                ui.table(
+                    ["NAME", "STATE", "IMAGE", "CPUS", "MEMORY", "DISK"],
+                    machines.iter().map(|machine| machine_row(ui, machine)),
+                );
                 for machine in &machines {
                     if let Some(problem) = &machine.problem {
-                        eprintln!("{}: {problem}", machine.name);
+                        eprintln!(
+                            "{}: {}",
+                            Ui::stderr().paint(Tone::Warning, &machine.name),
+                            plain(problem)
+                        );
                     }
                 }
             }
@@ -610,33 +515,19 @@ fn main() -> ExitCode {
             let error = invalid(format!("Say which command. `{NAME} help` lists them."));
             println!("{}", json!({ "error": error }));
         } else {
-            eprintln!("{}", usage());
+            eprintln!("{}", help::overview(Ui::stderr()));
         }
         return ExitCode::from(2);
     };
-    match command.as_str() {
-        "help" if words.get(1).map(String::as_str) == Some("mcp") => {
-            println!("{}", mcp::usage());
-            return ExitCode::SUCCESS;
-        }
-        "help" | "--help" | "-h" => {
-            println!("{}", usage());
-            return ExitCode::SUCCESS;
-        }
-        "version" | "--version" if json => {
-            println!(
-                "{}",
-                json!({ "name": NAME, "version": env!("CARGO_PKG_VERSION"), "api": API })
-            );
-            return ExitCode::SUCCESS;
-        }
-        "version" | "--version" => {
-            println!("{NAME} {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        _ => {}
-    }
-    match run(&command, &words[1..], json) {
+    let result = if let Some(topic) = help::requested(&words, json) {
+        help::page(Ui::new(std::io::stdout(), !json), topic).map(|page| {
+            println!("{page}");
+            serde_json::Value::Null.into()
+        })
+    } else {
+        run(&command, &words[1..], json)
+    };
+    match result {
         Ok(done) => {
             if json && !done.result.is_null() {
                 println!("{}", done.result);
@@ -647,7 +538,7 @@ fn main() -> ExitCode {
             if json {
                 println!("{}", json!({ "error": error }));
             } else {
-                eprintln!("{NAME}: {}", plain(&error.message));
+                ui::error(&error.message);
             }
             // A command that was written wrongly ends as the usage does.
             ExitCode::from(if error.code == ErrorCode::InvalidArgument {
@@ -656,5 +547,32 @@ fn main() -> ExitCode {
                 1
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_growing_progress_line_keeps_its_heading() {
+        let mut meter = Meter::new(false);
+        meter.ui.color = false;
+        let mut output = Vec::new();
+        let step = "Downloading the image";
+        meter.draw(&mut output, 43, step, "0 B of 1 GiB (0%)", true);
+        assert!(!output.contains(&b'\n'));
+
+        output.clear();
+        meter.draw(&mut output, 43, step, "101 MiB of 1 GiB (10%)", false);
+        assert!(
+            std::str::from_utf8(&output)
+                .unwrap()
+                .contains("Downloading the image\n")
+        );
+
+        output.clear();
+        meter.draw(&mut output, 43, step, "1 GiB of 1 GiB (100%)", false);
+        assert!(std::str::from_utf8(&output).unwrap().starts_with("\r1 GiB"));
     }
 }

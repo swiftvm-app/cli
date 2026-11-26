@@ -6,7 +6,8 @@ use std::path::Path;
 use host::{Host, ImageKind, ImageSummary, Result, SnapshotInfo};
 use serde_json::json;
 
-use crate::{Arguments, Done, Meter, invalid, print_table, size};
+use crate::ui::{Tone, Ui, success};
+use crate::{Arguments, Done, Meter, invalid, plain, size};
 
 /// The two things a command is about, such as a machine and a snapshot.
 fn pair<'a>(arguments: &'a Arguments, first: &str, second: &str) -> Result<(&'a str, &'a str)> {
@@ -31,33 +32,28 @@ pub fn list(words: &[String], json: bool) -> Result<Done> {
     arguments.nothing_else()?;
     let images = Host::open()?.images(arguments.flag("all"));
     if !json {
-        let mut rows = vec![["IMAGE", "KIND", "WHAT", "STORED"].map(String::from).to_vec()];
-        rows.extend(images.iter().map(|image| {
+        let ui = Ui::stdout();
+        let rows = images.iter().map(|image| {
             let stored = match (image.kind, image.size) {
-                (ImageKind::Catalog, _) => if image.cached { "yes" } else { "no" }.to_string(),
-                (_, Some(bytes)) if image.cached => size(bytes),
-                _ => "missing".to_string(),
+                (ImageKind::Catalog, _) if image.cached => ui.paint(Tone::Good, "yes"),
+                (ImageKind::Catalog, _) => ui.paint(Tone::Muted, "no"),
+                (_, Some(bytes)) if image.cached => ui.paint(Tone::Good, &size(bytes)),
+                _ => ui.paint(Tone::Warning, "missing"),
             };
-            vec![
-                image.id.clone(),
+            [
+                ui.paint(Tone::Bold, &image.id),
                 kind(image.kind).into(),
-                image.name.clone(),
+                plain(&image.name),
                 stored,
             ]
-        }));
-        print_table(&rows);
+        });
+        ui.table(["IMAGE", "KIND", "DESCRIPTION", "STORED"], rows);
     }
     Ok(json!({ "images": images }).into())
 }
 
 fn meter(json: bool) -> Meter {
     Meter::new(json)
-}
-
-fn said(json: bool, text: String) {
-    if !json {
-        println!("{text}");
-    }
 }
 
 fn image_done(image: ImageSummary) -> Done {
@@ -82,7 +78,7 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
             });
             meter.finish();
             let saved = saved?;
-            said(
+            success(
                 json,
                 if arguments.flag("delete") {
                     format!("Saved {machine} as the image {image}, and deleted {machine}.")
@@ -96,21 +92,21 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
             let arguments = Arguments::parse(words, &[], &[])?;
             let image = arguments.subject("image")?;
             host.delete_image(image)?;
-            said(json, format!("Deleted the image {image}."));
+            success(json, format!("Deleted the image {image}."));
             Ok(json!({ "deleted": image }).into())
         }
         "rename" => {
             let arguments = Arguments::parse(words, &[], &[])?;
             let (image, name) = pair(&arguments, "image", "new name")?;
             let renamed = host.rename_image(image, name)?;
-            said(json, format!("Renamed the image {image} to {name}."));
+            success(json, format!("Renamed the image {image} to {name}."));
             Ok(image_done(renamed))
         }
         "export" => {
             let arguments = Arguments::parse(words, &[], &[])?;
             let (image, file) = pair(&arguments, "image", "file to write")?;
             host.export_image(image, Path::new(file))?;
-            said(json, format!("Exported the image {image} to {file}."));
+            success(json, format!("Exported the image {image} to {file}."));
             Ok(json!({ "exported": image, "file": file }).into())
         }
         "import" => {
@@ -123,7 +119,7 @@ pub fn run(words: &[String], json: bool) -> Result<Done> {
             });
             meter.finish();
             let imported = imported?;
-            said(json, format!("Imported the image {}.", imported.id));
+            success(json, format!("Imported the image {}.", imported.id));
             Ok(image_done(imported))
         }
         _ => Err(invalid(format!(
@@ -145,36 +141,38 @@ pub fn snapshots(command: &str, words: &[String], json: bool) -> Result<Done> {
             let machine = arguments.subject("machine")?;
             let snapshots = host.snapshots(machine)?;
             if !json && snapshots.is_empty() {
-                println!("{machine} has no snapshots.");
+                println!("{} has no snapshots.", Ui::stdout().paint(Tone::Bold, machine));
             } else if !json {
-                let mut rows = vec![["SNAPSHOT", "TAKEN", "SIZE"].map(String::from).to_vec()];
-                rows.extend(snapshots.iter().map(|snapshot| {
-                    vec![
-                        snapshot.name.clone(),
-                        crate::ago(snapshot.created),
-                        size(snapshot.size),
-                    ]
-                }));
-                print_table(&rows);
+                let ui = Ui::stdout();
+                ui.table(
+                    ["SNAPSHOT", "TAKEN", "SIZE"],
+                    snapshots.iter().map(|snapshot| {
+                        [
+                            ui.paint(Tone::Bold, &snapshot.name),
+                            crate::ago(snapshot.created),
+                            size(snapshot.size),
+                        ]
+                    }),
+                );
             }
             Ok(json!({ "snapshots": snapshots }).into())
         }
         "snapshot" => {
             let (machine, name) = pair(&arguments, "machine", "name for the snapshot")?;
             let taken = host.snapshot(machine, name)?;
-            said(json, format!("Took the snapshot {name} of {machine}."));
+            success(json, format!("Took the snapshot {name} of {machine}."));
             Ok(snapshot_json(&taken).into())
         }
         "revert" => {
             let (machine, name) = pair(&arguments, "machine", "snapshot")?;
             host.revert(machine, name)?;
-            said(json, format!("Reverted {machine} to the snapshot {name}."));
+            success(json, format!("Reverted {machine} to the snapshot {name}."));
             Ok(json!({ "machine": host.machine(machine)?, "reverted": name }).into())
         }
         "delete-snapshot" => {
             let (machine, name) = pair(&arguments, "machine", "snapshot")?;
             host.delete_snapshot(machine, name)?;
-            said(json, format!("Deleted the snapshot {name} of {machine}."));
+            success(json, format!("Deleted the snapshot {name} of {machine}."));
             Ok(json!({ "machine": host.machine(machine)?, "deleted": name }).into())
         }
         _ => unreachable!("only the snapshot commands come here"),

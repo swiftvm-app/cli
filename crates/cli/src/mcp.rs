@@ -9,23 +9,6 @@ use std::time::Duration;
 use host::{Button, Direction, ExecOptions, Host, MachineState, NAME};
 use serde_json::{Map, Value, json};
 
-pub fn usage() -> String {
-    format!(
-        r#"usage: {NAME} mcp
-
-Serve the Model Context Protocol on standard input and output, for AI agents. Add it to one with:
-
-  claude mcp add {NAME} -- {NAME} mcp
-
-or in any client's configuration:
-
-  {{"mcpServers": {{"{NAME}": {{"command": "{NAME}", "args": ["mcp"]}}}}}}
-
-Each tool's description says what it does; the first to call is vm_list. The desktop's tools
-need a machine created with a desktop script, such as --script xfce."#
-    )
-}
-
 pub const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INSTRUCTIONS: &str = "Control Linux virtual machines on this computer: their desktops, commands and files. \
@@ -36,7 +19,9 @@ instructions.";
 
 pub fn run(words: &[String]) -> crate::Result<crate::Done> {
     if !words.is_empty() {
-        return Err(crate::invalid(usage()));
+        return Err(crate::invalid(format!(
+            "Run `{NAME} mcp` without arguments. See `{NAME} help mcp` for client configuration."
+        )));
     }
     // A client that has gone isn't written to: the next read ends the loop.
     // Safety: ignoring a signal changes nothing else.
